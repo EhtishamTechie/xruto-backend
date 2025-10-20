@@ -23,6 +23,7 @@ let orderStatusMap = new Map(); // Track order delivery status
 app.use(cors({
   origin: [
     'https://xruto-frontend.vercel.app',
+    https://xruto-frontend-1bl2vjf70-ummah-tech-innovation.vercel.app,
     'http://localhost:3000',  // Create React App default
     'http://localhost:5173',  // Vite default
     'http://localhost:5174',  // Vite alternative port 1
