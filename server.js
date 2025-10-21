@@ -18,36 +18,35 @@ const PORT = process.env.PORT || 5000;
 // Store route-order relationships in memory
 let routeOrdersMap = new Map();
 let orderStatusMap = new Map(); // Track order delivery status
-
-// Middleware - Fixed CORS for Vite (ports 5173-5180)
+// Middleware - Fixed CORS for Vite and Vercel
 app.use(cors({
   origin: [
     'https://xruto-frontend.vercel.app',
-    https://xruto-frontend-1bl2vjf70-ummah-tech-innovation.vercel.app,
-    'http://localhost:3000',  // Create React App default
-    'http://localhost:5173',  // Vite default
-    'http://localhost:5174',  // Vite alternative port 1
-    'http://localhost:5175',  // Vite alternative port 2
-    'http://localhost:5176',  // Vite alternative port 3
-    'http://localhost:5177',  // Vite alternative port 4
-    'http://localhost:5178',  // Vite alternative port 5
-    'http://localhost:5179',  // Vite alternative port 6
-    'http://localhost:5180',  // Vite alternative port 7
-    'http://127.0.0.1:5173',  // Alternative localhost
-    'http://127.0.0.1:5174',  // Alternative localhost
-    'http://127.0.0.1:5175',  // Alternative localhost
-    'http://127.0.0.1:5176',  // Alternative localhost
-    'http://127.0.0.1:5177',  // Alternative localhost
-    'http://127.0.0.1:5178',  // Alternative localhost
-    'http://127.0.0.1:5179',  // Alternative localhost
-    'http://127.0.0.1:5180',  // Alternative localhost
+    'https://xruto-frontend-1bl2vjf70-ummah-tech-innovation.vercel.app',  // ✅ ADD THIS LINE
+    /^https:\/\/xruto-frontend.*\.vercel\.app$/,  // ✅ ADD THIS LINE - Allows ALL Vercel previews
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:5175',
+    'http://localhost:5176',
+    'http://localhost:5177',
+    'http://localhost:5178',
+    'http://localhost:5179',
+    'http://localhost:5180',
+    'http://127.0.0.1:5173',
+    'http://127.0.0.1:5174',
+    'http://127.0.0.1:5175',
+    'http://127.0.0.1:5176',
+    'http://127.0.0.1:5177',
+    'http://127.0.0.1:5178',
+    'http://127.0.0.1:5179',
+    'http://127.0.0.1:5180',
     process.env.CLIENT_URL
   ].filter(Boolean),
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],  // ✅ Added PATCH
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
-
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -2540,12 +2539,11 @@ app.use((error, req, res, next) => {
     error: error.message
   });
 });
-
-// Start server
-app.listen(PORT , '0.0.0.0' () => {
+// Start server - MUST use 0.0.0.0 for Railway
+app.listen(PORT, '0.0.0.0', () => {  // ✅ ADD '0.0.0.0' HERE!
   console.log('\n🚀 xRuto Standalone Server Started Successfully!');
-  console.log(`📍 Server running on http://localhost:${PORT}`);
-  console.log(`🔗 Health check: http://localhost:${PORT}/api/health`);
+  console.log(`📍 Server running on http://0.0.0.0:${PORT}`);  // ✅ Changed to 0.0.0.0
+  console.log(`🔗 Health check: http://0.0.0.0:${PORT}/api/health`);  // ✅ Changed to 0.0.0.0
   console.log(`💾 Database: ${process.env.SUPABASE_URL ? 'Supabase Connected' : 'Mock Data Mode'}`);
   console.log('\n📋 Available endpoints:');
   console.log('   GET  /api/health');
@@ -2573,4 +2571,5 @@ app.listen(PORT , '0.0.0.0' () => {
   console.log('📊 Route-order tracking: Dynamic order management active');
 });
 
+module.exports = app;
 module.exports = app;
