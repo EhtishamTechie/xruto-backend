@@ -4,6 +4,9 @@ node_modules/
 # Ignore environment variables
 .env
 
+# Local database
+db.json
+
 # Logs
 logs
 *.log
