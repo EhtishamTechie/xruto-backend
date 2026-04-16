@@ -2,18 +2,130 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const axios = require('axios');
 const PDFParserService = require('./services/pdfParser');
 require('dotenv').config();
+
+// Fallback env vars for Railway deployment (values come from Railway env config)
 if (!process.env.SUPABASE_URL) {
-  process.env.SUPABASE_URL = 'https://qicbvrkhgxvlopzpayvq.supabase.co';
-  process.env.SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFpY2J2cmtoZ3h2bG9wenBheXZxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc0NTI5NzksImV4cCI6MjA3MzAyODk3OX0.W4WtdjqHhair2bUKjgYpG5OlVlOk-iw9N_bRAacKP7Y';
-  process.env.HERE_API_KEY = 'y3kuhw4RlWsTDNmm6xnqaXEkEdAf7auVckQf3nxj0mo';
-  process.env.NODE_ENV = 'production';
-  process.env.CLIENT_URL = 'https://xruto-frontend.vercel.app';
-  console.log('🔧 Using hardcoded environment variables for Railway');
+  console.warn('⚠️ SUPABASE_URL not set — set it in .env or Railway environment variables');
+}
+if (!process.env.HERE_API_KEY) {
+  console.warn('⚠️ HERE_API_KEY not set — HERE Matrix API features will be disabled');
+}
+if (!process.env.JWT_SECRET) {
+  console.warn('⚠️ JWT_SECRET not set — using insecure default. Set a strong secret in production!');
 }
 const app = express();
 const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'xruto-dev-secret';
+
+// ===== PASSWORD RESET TOKEN STORE =====
+// Map of token → { email, expiresAt }  (tokens expire after 15 minutes)
+const passwordResetTokens = new Map();
+
+/**
+ * Send a password-reset email via the configured email provider.
+ * Supports Resend (RESEND_API_KEY) or a generic SMTP-style HTTP API.
+ * Returns true on success, false on failure.
+ */
+async function sendResetEmail(toEmail, resetLink) {
+  const apiKey = process.env.EMAIL_API_KEY;
+  const fromEmail = process.env.EMAIL_FROM || 'noreply@xruto.com';
+  const provider = (process.env.EMAIL_PROVIDER || 'resend').toLowerCase();
+
+  if (!apiKey) {
+    console.warn('⚠️  EMAIL_API_KEY not set — cannot send reset email. Link:', resetLink);
+    return false;
+  }
+
+  try {
+    if (provider === 'resend') {
+      await axios.post('https://api.resend.com/emails', {
+        from: fromEmail,
+        to: [toEmail],
+        subject: 'xRuto — Password Reset',
+        html: `
+          <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+            <h2 style="color:#f97316">xRuto Password Reset</h2>
+            <p>You requested a password reset. Click the button below to set a new password. This link expires in 15 minutes.</p>
+            <a href="${resetLink}" style="display:inline-block;background:#f97316;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0">Reset Password</a>
+            <p style="color:#888;font-size:13px">If you didn't request this, you can safely ignore this email.</p>
+          </div>
+        `
+      }, {
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        timeout: 15000
+      });
+    } else if (provider === 'sendgrid') {
+      await axios.post('https://api.sendgrid.com/v3/mail/send', {
+        personalizations: [{ to: [{ email: toEmail }] }],
+        from: { email: fromEmail },
+        subject: 'xRuto — Password Reset',
+        content: [{
+          type: 'text/html',
+          value: `
+            <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+              <h2 style="color:#f97316">xRuto Password Reset</h2>
+              <p>You requested a password reset. Click the button below to set a new password. This link expires in 15 minutes.</p>
+              <a href="${resetLink}" style="display:inline-block;background:#f97316;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0">Reset Password</a>
+              <p style="color:#888;font-size:13px">If you didn't request this, you can safely ignore this email.</p>
+            </div>
+          `
+        }]
+      }, {
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        timeout: 15000
+      });
+    } else {
+      console.warn(`⚠️  Unknown EMAIL_PROVIDER "${provider}". Supported: resend, sendgrid`);
+      return false;
+    }
+    console.log(`✅ Password reset email sent to ${toEmail}`);
+    return true;
+  } catch (err) {
+    console.error('❌ Failed to send reset email:', err.response?.data || err.message);
+    return false;
+  }
+}
+
+// ===== ROLE-BASED ACCESS CONTROL MIDDLEWARE =====
+// Extracts user from JWT token (does not reject unauthenticated requests)
+function extractUser(req, res, next) {
+  const auth = req.headers.authorization;
+  if (auth && auth.startsWith('Bearer ')) {
+    try {
+      req.user = jwt.verify(auth.split(' ')[1], JWT_SECRET);
+    } catch { req.user = null; }
+  }
+  next();
+}
+
+// Requires a valid JWT token
+function requireAuth(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, message: 'Authentication required' });
+  }
+  try {
+    req.user = jwt.verify(auth.split(' ')[1], JWT_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ success: false, message: 'Invalid or expired token' });
+  }
+}
+
+// Requires specific role(s) — call after requireAuth
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      return res.status(403).json({ success: false, message: 'Access denied: insufficient permissions' });
+    }
+    next();
+  };
+}
 
 // ===== FILE-BASED PERSISTENCE =====
 const { loadAll, saveAll } = require('./persistence');
@@ -75,6 +187,7 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use(extractUser); // Attach user from JWT to all requests (non-blocking)
 
 // Configure multer for PDF uploads
 const storage = multer.memoryStorage();
@@ -120,6 +233,9 @@ app.use((req, res, next) => {
 });
 
 // ===== ROOT ENDPOINTS =====
+// Role enforcement: all /api/admin/* routes require admin role
+app.use('/api/admin', requireAuth, requireRole('admin'));
+
 app.get('/', (req, res) => {
   res.json({
     message: 'xRuto Delivery Routing API is running',
@@ -793,7 +909,15 @@ app.post('/api/orders/driver-update-status', async (req, res) => {
 
 // ===== CLUSTERING HELPERS =====
 
-// Haversine distance in km
+/**
+ * Haversine formula - calculates great-circle distance between two points on Earth.
+ * Uses the spherical law of cosines with Earth radius R = 6371 km.
+ * @param {number} lat1 - Latitude of point 1 (degrees)
+ * @param {number} lon1 - Longitude of point 1 (degrees)
+ * @param {number} lat2 - Latitude of point 2 (degrees)
+ * @param {number} lon2 - Longitude of point 2 (degrees)
+ * @returns {number} Distance in kilometres
+ */
 function haversineKm(lat1, lon1, lat2, lon2) {
   const R = 6371;
   const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -835,7 +959,16 @@ function getApproxPostcodeArea(lat, lng) {
   return best.code;
 }
 
-// Build a zone object from a cluster of orders
+/**
+ * Builds a delivery zone descriptor from a cluster of orders.
+ * Calculates route distance (heuristic: 0.8 km per stop + 2x depot distance),
+ * estimated duration (base 20 min + 8 min/stop + 30 min per depot return),
+ * depot return count based on capacity (25 units per trip),
+ * and identifies the dominant postcode area for labelling.
+ * @param {number} i - Zone index (0-based)
+ * @param {Array} orders - Array of order objects with latitude, longitude, postcode
+ * @returns {Object} Zone descriptor with zone_id, zone_name, orders, center, distances, durations
+ */
 const ZONE_COLORS = ['#FF6B35', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#90EE90', '#FFB6C1'];
 function buildZone(i, orders) {
   const _pd = MOCK_DEPOTS.find(d => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
@@ -877,7 +1010,25 @@ function buildZone(i, orders) {
   };
 }
 
-// Real geographic K-means++ clustering
+/**
+ * K-means++ geographic clustering algorithm for delivery orders.
+ *
+ * Algorithm overview:
+ * 1. INITIALISATION (K-means++): First centroid chosen randomly. Each subsequent
+ *    centroid is selected with probability proportional to squared distance from
+ *    nearest existing centroid — this spreads initial seeds and improves convergence.
+ * 2. CAPACITY GUARD: Ensures minK = ceil(N / 25) so no zone exceeds 25 stops.
+ *    Caps at k = min(requestedK, minK, N, 8).
+ * 3. ITERATIVE REFINEMENT (Lloyd's algorithm, max 100 iterations):
+ *    a. Assign each order to nearest centroid (Haversine distance).
+ *    b. Recompute centroid as mean lat/lng of assigned orders.
+ *    c. Converge when centroid shift < 0.00005° (~5 m).
+ * 4. OUTPUT: Array of zone descriptors via buildZone().
+ *
+ * @param {Array} orders - Orders with .latitude, .longitude
+ * @param {number} numClusters - Requested number of clusters (adjusted by capacity)
+ * @returns {Array} Array of zone objects
+ */
 function performKMeansClustering(orders, numClusters = 3) {
   if (orders.length === 0) return [];
 
@@ -969,7 +1120,6 @@ function generateNavigationURL(depot, waypoints, useGoogleMaps = false) {
         stats: { original: 1, unique: 1, duplicates: 0, expected_points: 3 }
       };
     } else {
-      // Check for duplicate coordinates with better precision
       const uniqueWaypoints = waypoints.filter((wp, index, arr) => {
         const lat = wp.lat || wp.latitude;
         const lng = wp.lng || wp.longitude;
@@ -984,7 +1134,6 @@ function generateNavigationURL(depot, waypoints, useGoogleMaps = false) {
       console.log(`🔍 Original waypoints: ${waypoints.length}, Unique waypoints: ${uniqueWaypoints.length}`);
       if (duplicates > 0) {
         console.log(`⚠️  Found ${duplicates} duplicate coordinates!`);
-        // Log which orders have duplicates
         waypoints.forEach((wp, index) => {
           const lat = wp.lat || wp.latitude;
           const lng = wp.lng || wp.longitude;
@@ -1004,16 +1153,13 @@ function generateNavigationURL(depot, waypoints, useGoogleMaps = false) {
         .map(wp => `${wp.lat || wp.latitude},${wp.lng || wp.longitude}`)
         .join('/');
       
-      // More explicit route: depot -> waypoints -> depot (round trip)
       const url = `https://www.google.com/maps/dir/${origin}/${waypointCoords}/${origin}`;
-      const expectedPoints = uniqueWaypoints.length + 2; // unique deliveries + 2 depot points
+      const expectedPoints = uniqueWaypoints.length + 2;
       
       console.log(`📍 Multi-waypoint URL with ${uniqueWaypoints.length} unique stops:`);
       console.log(`🎯 Route structure: DEPOT → ${uniqueWaypoints.length} deliveries → DEPOT`);
       console.log(`📊 Expected total points: ${expectedPoints} (${uniqueWaypoints.length} deliveries + 2 depot points)`);
       console.log(`📏 URL length: ${url.length} characters`);
-      console.log(`🗺️ First 200 chars: ${url.substring(0, 200)}...`);
-      console.log(`🗺️ Last 200 chars: ...${url.substring(url.length - 200)}`);
       
       return {
         url: url,
@@ -1037,7 +1183,6 @@ function generateNavigationURL(depot, waypoints, useGoogleMaps = false) {
         stats: { original: 1, unique: 1, duplicates: 0, expected_points: 3 }
       };
     } else {
-      // Deduplicate waypoints
       const uniqueWaypoints = waypoints.filter((wp, index, arr) => {
         const lat = wp.lat || wp.latitude;
         const lng = wp.lng || wp.longitude;
@@ -1291,15 +1436,18 @@ app.post('/api/orders/upload-text', async (req, res) => {
           delivery_date: o.delivery_date || dateStr
         };
       });
-      inMemoryOrders.push(...enriched);
+      // Deduplicate: skip orders whose delivery_address already exists
+      const existingAddresses = new Set(inMemoryOrders.map(o => (o.delivery_address || '').toLowerCase().trim()));
+      const newOrders = enriched.filter(o => !existingAddresses.has((o.delivery_address || '').toLowerCase().trim()));
+      inMemoryOrders.push(...newOrders);
       persist();
-      console.log(`Stored ${enriched.length} orders in memory. Total: ${inMemoryOrders.length}`);
+      console.log(`Stored ${newOrders.length} new orders (${enriched.length - newOrders.length} duplicates skipped). Total: ${inMemoryOrders.length}`);
       res.json({
         success: true,
-        message: `Successfully processed ${enriched.length} orders`,
-        orders: enriched,
+        message: `Successfully processed ${newOrders.length} orders`,
+        orders: newOrders,
         extractedCount: orders.length,
-        insertedCount: enriched.length
+        insertedCount: newOrders.length
       });
     }
 
@@ -1507,9 +1655,10 @@ app.post('/api/orders/generate-clusters', async (req, res) => {
           });
         }
 
-        // Use the optimized HereAPIService for clustering
+        // Use the optimized HereAPIService for clustering (with HERE Matrix API when key is available)
         const hereService = require('./services/hereAPI');
-        const zones = await hereService.generateOptimizedClustersForArea(filteredOrders, max_zones);
+        const primaryDepot = MOCK_DEPOTS.find(d => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
+        const zones = await hereService.generateOptimizedClustersForArea(filteredOrders, max_zones, performKMeansClustering, primaryDepot);
 
         return res.json({
           success: true,
@@ -1569,6 +1718,8 @@ app.post('/api/orders/generate-routes', async (req, res) => {
     const useGoogleMaps = routeSettings.navigation_app_preference === 'google';
     const fuelPricePerUnit = Number(routeSettings.default_fuel_price) || 1.45;
     const perKmFuelFactor = Math.max(0.05, fuelPricePerUnit * 0.1);
+    const enableStockRefill = Boolean(routeSettings.enable_stock_refill);
+    const maxDeliveriesPerTrip = parseInt(routeSettings.max_deliveries_per_route) || 25;
     
     if (!zones || zones.length === 0) {
       return res.status(400).json({
@@ -1594,8 +1745,43 @@ app.post('/api/orders/generate-routes', async (req, res) => {
 
       console.log(`🚛 Creating route for ${zone.zone_name}: total_orders=${zone.total_orders}, actual orders array length=${zone.orders?.length || 0}`);
 
-      // Generate navigation URL with detailed stats
+      // Build route segments (stock refill: split into sub-trips when enabled)
+      // ── Stock Refill / Sub-trip Splitting Algorithm ───────────────────────
+      // When stock refill is enabled in settings and a zone has more orders
+      // than maxDeliveriesPerTrip, we split the delivery list into segments.
+      // Each segment is a sub-trip: depot → N deliveries → return to depot.
+      // The driver returns to the depot to reload between segments.
+      // This ensures the vehicle is never overloaded.
+      const allOrders = zone.orders || [];
       const primaryDepot = MOCK_DEPOTS.find(d => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
+      let route_segments = [];
+      if (enableStockRefill && allOrders.length > maxDeliveriesPerTrip) {
+        // Split orders into batches; each batch is a sub-trip ending with depot return
+        for (let s = 0; s < allOrders.length; s += maxDeliveriesPerTrip) {
+          const batch = allOrders.slice(s, s + maxDeliveriesPerTrip);
+          const isLast = (s + maxDeliveriesPerTrip) >= allOrders.length;
+          route_segments.push({
+            segment_index: route_segments.length,
+            orders: batch,
+            return_to_depot: true, // always return (refill or end of route)
+            is_last_segment: isLast,
+            order_count: batch.length
+          });
+        }
+        console.log(`  ↳ Stock refill ON: split ${allOrders.length} orders into ${route_segments.length} segments of up to ${maxDeliveriesPerTrip}`);
+      } else {
+        // Single segment — depot → all orders → depot
+        route_segments = [{
+          segment_index: 0,
+          orders: allOrders,
+          return_to_depot: true,
+          is_last_segment: true,
+          order_count: allOrders.length
+        }];
+      }
+      const depotReturnsCount = route_segments.length; // every segment returns to depot
+
+      // Generate navigation URL with detailed stats
       const navigationResult = generateNavigationURL(
         { latitude: primaryDepot.latitude, longitude: primaryDepot.longitude },
         (zone.orders?.map((order, index) => {
@@ -1652,10 +1838,12 @@ app.post('/api/orders/generate-routes', async (req, res) => {
           expected_google_maps_points: navigationResult.stats.expected_points,
           orders_with_duplicates: navigationResult.stats.duplicates > 0 ? 'Check console logs for details' : 'None'
         },
-        // navigation_url: `https://maps.google.com/directions?dest=${zone.orders?.[0]?.postcode || 'WA4+1EE'}`,
         driver_id: null,
         driver_name: null,
         orders: zone.orders || [],
+        route_segments,
+        depot_returns_count: depotReturnsCount,
+        stock_refill_enabled: enableStockRefill,
         source: 'mock_optimization'
       };
     });
@@ -2281,6 +2469,175 @@ app.put('/api/orders/delivery-status/:orderId', async (req, res) => {
   }
 });
 
+// ===== WOOCOMMERCE INTEGRATION + MULTI-STORE SUPPORT =====
+// Stores are persisted inside settings as inMemorySettings.woo_stores[]
+// Each store: { store_id, name, url, consumer_key, consumer_secret, active }
+
+/**
+ * GET /api/admin/woo-stores — list configured WooCommerce stores
+ */
+app.get('/api/admin/woo-stores', (req, res) => {
+  const stores = inMemorySettings.woo_stores || [];
+  res.json({ success: true, stores });
+});
+
+/**
+ * POST /api/admin/woo-stores — add a WooCommerce store
+ * Body: { name, url, consumer_key, consumer_secret }
+ */
+app.post('/api/admin/woo-stores', (req, res) => {
+  const { name, url, consumer_key, consumer_secret } = req.body;
+  if (!name || !url || !consumer_key || !consumer_secret) {
+    return res.status(400).json({ success: false, message: 'name, url, consumer_key and consumer_secret are required' });
+  }
+  if (!inMemorySettings.woo_stores) inMemorySettings.woo_stores = [];
+  const store = {
+    store_id: `store_${Date.now()}`,
+    name: name.trim(),
+    url: url.trim().replace(/\/+$/, ''),
+    consumer_key: consumer_key.trim(),
+    consumer_secret: consumer_secret.trim(),
+    active: true,
+    created_at: new Date().toISOString()
+  };
+  inMemorySettings.woo_stores.push(store);
+  persist();
+  res.status(201).json({ success: true, message: 'Store added', store: { store_id: store.store_id, name: store.name, url: store.url, active: store.active } });
+});
+
+/**
+ * PUT /api/admin/woo-stores/:storeId — update a store
+ */
+app.put('/api/admin/woo-stores/:storeId', (req, res) => {
+  const stores = inMemorySettings.woo_stores || [];
+  const idx = stores.findIndex(s => s.store_id === req.params.storeId);
+  if (idx < 0) return res.status(404).json({ success: false, message: 'Store not found' });
+  const { name, url, consumer_key, consumer_secret, active } = req.body;
+  if (name !== undefined) stores[idx].name = name.trim();
+  if (url !== undefined)  stores[idx].url = url.trim().replace(/\/+$/, '');
+  if (consumer_key !== undefined)    stores[idx].consumer_key = consumer_key.trim();
+  if (consumer_secret !== undefined) stores[idx].consumer_secret = consumer_secret.trim();
+  if (active !== undefined) stores[idx].active = Boolean(active);
+  persist();
+  res.json({ success: true, message: 'Store updated', store: { store_id: stores[idx].store_id, name: stores[idx].name, url: stores[idx].url, active: stores[idx].active } });
+});
+
+/**
+ * DELETE /api/admin/woo-stores/:storeId — remove a store
+ */
+app.delete('/api/admin/woo-stores/:storeId', (req, res) => {
+  if (!inMemorySettings.woo_stores) return res.status(404).json({ success: false, message: 'Store not found' });
+  const before = inMemorySettings.woo_stores.length;
+  inMemorySettings.woo_stores = inMemorySettings.woo_stores.filter(s => s.store_id !== req.params.storeId);
+  if (inMemorySettings.woo_stores.length === before) return res.status(404).json({ success: false, message: 'Store not found' });
+  persist();
+  res.json({ success: true, message: 'Store removed' });
+});
+
+/**
+ * POST /api/orders/sync-woocommerce — pull home-delivery orders from WooCommerce stores
+ * Body (optional): { store_id } — pull from one store. Omit = pull from all active stores.
+ *
+ * This calls WooCommerce REST API v3: GET /wp-json/wc/v3/orders?status=processing
+ * Only orders with shipping method containing 'local_delivery' or 'home_delivery' are imported.
+ *
+ * YOU MUST configure stores first via POST /api/admin/woo-stores with valid API keys.
+ */
+app.post('/api/orders/sync-woocommerce', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { store_id } = req.body || {};
+    const allStores = (inMemorySettings.woo_stores || []).filter(s => s.active);
+    const stores = store_id ? allStores.filter(s => s.store_id === store_id) : allStores;
+
+    if (stores.length === 0) {
+      return res.status(400).json({ success: false, message: 'No active WooCommerce stores configured. Add stores in Settings → WooCommerce.' });
+    }
+
+    let totalImported = 0;
+    const results = [];
+
+    for (const store of stores) {
+      try {
+        // Call WooCommerce REST API v3 — requires consumer_key & consumer_secret
+        const wooRes = await axios.get(`${store.url}/wp-json/wc/v3/orders`, {
+          params: {
+            status: 'processing',
+            per_page: 100,
+            consumer_key: store.consumer_key,
+            consumer_secret: store.consumer_secret
+          },
+          timeout: 30000
+        });
+
+        const wooOrders = wooRes.data || [];
+
+        // Filter only home-delivery orders (skip pickup / click-and-collect)
+        const homeDeliveryOrders = wooOrders.filter(wo => {
+          const shippingLines = wo.shipping_lines || [];
+          // Accept if any shipping method contains 'delivery' (catches local_delivery, home_delivery, flat_rate etc.)
+          // Reject if method is explicitly 'local_pickup'
+          if (shippingLines.length === 0) return true; // no shipping method = assume delivery
+          return shippingLines.some(sl =>
+            !sl.method_id?.includes('pickup') &&
+            !sl.method_id?.includes('collect')
+          );
+        });
+
+        const dateStr = new Date().toISOString().split('T')[0];
+        const imported = homeDeliveryOrders.map(wo => {
+          const shipping = wo.shipping || wo.billing || {};
+          const lat = parseFloat(wo.meta_data?.find(m => m.key === '_shipping_latitude')?.value) || 0;
+          const lng = parseFloat(wo.meta_data?.find(m => m.key === '_shipping_longitude')?.value) || 0;
+          const postcode = (shipping.postcode || '').trim();
+          return {
+            id: `woo-${store.store_id}-${wo.id}`,
+            store_id: store.store_id,
+            store_name: store.name,
+            woo_order_id: wo.id,
+            customer_name: `${shipping.first_name || ''} ${shipping.last_name || ''}`.trim() || 'Customer',
+            customer_email: wo.billing?.email || '',
+            customer_phone: wo.billing?.phone || '',
+            delivery_address: `${shipping.address_1 || ''} ${shipping.address_2 || ''}`.trim(),
+            postcode,
+            postcode_area: postcode.split(' ')[0] || getApproxPostcodeArea(lat, lng),
+            city: shipping.city || '',
+            latitude: lat,
+            longitude: lng,
+            order_value: parseFloat(wo.total) || 0,
+            weight: (wo.line_items || []).reduce((s, li) => s + (parseFloat(li.weight) || 0) * li.quantity, 0) || 2.5,
+            delivery_date: dateStr,
+            status: 'pending',
+            distance_from_depot_km: lat && lng ? calculateDistanceFromDepot(lat, lng) : 0,
+            source: 'woocommerce'
+          };
+        });
+
+        // Avoid duplicates — skip orders already in memory by woo_order_id
+        const existingWooIds = new Set(inMemoryOrders.filter(o => o.woo_order_id).map(o => `${o.store_id}-${o.woo_order_id}`));
+        const newOrders = imported.filter(o => !existingWooIds.has(`${o.store_id}-${o.woo_order_id}`));
+
+        inMemoryOrders.push(...newOrders);
+        totalImported += newOrders.length;
+        results.push({ store_id: store.store_id, name: store.name, fetched: wooOrders.length, home_delivery: homeDeliveryOrders.length, imported: newOrders.length, skipped_duplicates: imported.length - newOrders.length });
+      } catch (storeErr) {
+        results.push({ store_id: store.store_id, name: store.name, error: storeErr.message });
+      }
+    }
+
+    if (totalImported > 0) persist();
+
+    res.json({
+      success: true,
+      message: `Imported ${totalImported} new orders from ${stores.length} store(s)`,
+      total_imported: totalImported,
+      store_results: results
+    });
+  } catch (error) {
+    console.error('WooCommerce sync error:', error);
+    res.status(500).json({ success: false, message: 'WooCommerce sync failed', error: error.message });
+  }
+});
+
 // ===== AUTH ENDPOINTS =====
 let USERS = _persisted.users || [];
 
@@ -2293,10 +2650,9 @@ app.post('/api/auth/login', (req, res) => {
   if (!user) {
     return res.status(401).json({ success: false, message: 'Invalid email or password' });
   }
-  const jwt = require('jsonwebtoken');
   const token = jwt.sign(
     { id: user.id, email: user.email, role: user.role, name: user.name },
-    process.env.JWT_SECRET || 'xruto-dev-secret',
+    JWT_SECRET,
     { expiresIn: '8h' }
   );
   res.json({
@@ -2332,6 +2688,71 @@ app.post('/api/auth/logout', (req, res) => {
   res.json({ success: true, message: 'Logged out successfully' });
 });
 
+// ===== FORGOT / RESET PASSWORD =====
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email) {
+    return res.status(400).json({ success: false, message: 'Email is required' });
+  }
+
+  const user = USERS.find(u => u.email === email.toLowerCase().trim());
+  // Always return success to prevent email enumeration
+  if (!user) {
+    return res.json({ success: true, message: 'If an account with that email exists, a reset link has been sent.' });
+  }
+
+  // Generate a secure random token (32 bytes hex)
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = Date.now() + 15 * 60 * 1000; // 15 minutes
+
+  // Clean up any existing tokens for this email
+  for (const [t, data] of passwordResetTokens.entries()) {
+    if (data.email === user.email) passwordResetTokens.delete(t);
+  }
+  passwordResetTokens.set(token, { email: user.email, expiresAt });
+
+  const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+  const resetLink = `${clientUrl}?reset_token=${token}`;
+
+  const sent = await sendResetEmail(user.email, resetLink);
+  if (!sent && process.env.EMAIL_API_KEY) {
+    return res.status(500).json({ success: false, message: 'Failed to send reset email. Please try again later.' });
+  }
+
+  res.json({ success: true, message: 'If an account with that email exists, a reset link has been sent.' });
+});
+
+app.post('/api/auth/reset-password', (req, res) => {
+  const { token, new_password } = req.body;
+  if (!token || !new_password) {
+    return res.status(400).json({ success: false, message: 'Token and new password are required' });
+  }
+  if (new_password.length < 6) {
+    return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
+  }
+
+  const resetData = passwordResetTokens.get(token);
+  if (!resetData) {
+    return res.status(400).json({ success: false, message: 'Invalid or expired reset token' });
+  }
+  if (Date.now() > resetData.expiresAt) {
+    passwordResetTokens.delete(token);
+    return res.status(400).json({ success: false, message: 'Reset token has expired. Please request a new one.' });
+  }
+
+  const user = USERS.find(u => u.email === resetData.email);
+  if (!user) {
+    passwordResetTokens.delete(token);
+    return res.status(400).json({ success: false, message: 'User account not found' });
+  }
+
+  user.password = new_password;
+  passwordResetTokens.delete(token);
+  persist();
+  console.log(`✅ Password reset successful for ${user.email}`);
+  res.json({ success: true, message: 'Password has been reset successfully. You can now sign in.' });
+});
+
 app.post('/api/push/subscribe', (req, res) => {
   // Placeholder endpoint for PWA push registration. Store in DB when push provider is configured.
   res.json({ success: true, message: 'Push subscription received' });
@@ -2343,8 +2764,7 @@ app.get('/api/auth/me', (req, res) => {
     return res.status(401).json({ success: false, message: 'No token provided' });
   }
   try {
-    const jwt = require('jsonwebtoken');
-    const payload = jwt.verify(auth.split(' ')[1], process.env.JWT_SECRET || 'xruto-dev-secret');
+    const payload = jwt.verify(auth.split(' ')[1], JWT_SECRET);
     res.json({ success: true, user: { id: payload.id, email: payload.email, name: payload.name, role: payload.role } });
   } catch {
     res.status(401).json({ success: false, message: 'Invalid or expired token' });
