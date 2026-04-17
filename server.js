@@ -2639,7 +2639,36 @@ app.post('/api/orders/sync-woocommerce', requireAuth, requireRole('admin'), asyn
 });
 
 // ===== AUTH ENDPOINTS =====
-let USERS = _persisted.users || [];
+const DEFAULT_USERS = [
+  {
+    id: 'admin-1',
+    email: 'admin@xruto.com',
+    password: 'admin123',
+    name: 'Admin User',
+    role: 'admin',
+    avatar: null
+  },
+  {
+    id: 'driver-1',
+    email: 'driver@xruto.com',
+    password: 'driver123',
+    name: 'John Driver',
+    role: 'driver',
+    avatar: null
+  }
+];
+
+let USERS = Array.isArray(_persisted.users) ? [..._persisted.users] : [];
+
+for (const defaultUser of DEFAULT_USERS) {
+  if (!USERS.some(user => user.email === defaultUser.email)) {
+    USERS.push(defaultUser);
+  }
+}
+
+if (USERS.length > 0 && (!Array.isArray(_persisted.users) || _persisted.users.length === 0)) {
+  persist();
+}
 
 app.post('/api/auth/login', (req, res) => {
   const { email, password } = req.body;
