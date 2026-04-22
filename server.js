@@ -2799,6 +2799,38 @@ app.get('/api/auth/me', (req, res) => {
     res.status(401).json({ success: false, message: 'Invalid or expired token' });
   }
 });
+
+/** Change password while logged in (Settings → Security) — same USERS store as /api/auth/login */
+app.put('/api/auth/change-password', (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ success: false, message: 'Current password and new password are required' });
+  }
+  if (String(newPassword).length < 6) {
+    return res.status(400).json({ success: false, message: 'New password must be at least 6 characters' });
+  }
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, message: 'Authentication required' });
+  }
+  let payload;
+  try {
+    payload = jwt.verify(auth.split(' ')[1], JWT_SECRET);
+  } catch {
+    return res.status(401).json({ success: false, message: 'Invalid or expired token' });
+  }
+  const user = USERS.find(u => u.email === payload.email);
+  if (!user) {
+    return res.status(404).json({ success: false, message: 'User not found' });
+  }
+  if (user.password !== currentPassword) {
+    return res.status(401).json({ success: false, message: 'Current password is incorrect' });
+  }
+  user.password = newPassword;
+  persist();
+  res.json({ success: true, message: 'Password changed successfully' });
+});
+
 // Add these endpoints to your server.js file after line 900, right before the error handlers
 
 // GET /api/orders/driver-routes/:driverId - Get routes assigned to specific driver
