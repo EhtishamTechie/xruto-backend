@@ -1880,30 +1880,22 @@ app.post('/api/orders/generate-routes', async (req, res) => {
 app.get('/api/orders/get-routes', async (req, res) => {
   try {
     const { date = new Date().toISOString().split('T')[0] } = req.query;
-    
-    console.log('Getting generated routes for date:', date);
-    
+    const slim = String(req.query.slim) === '1' || String(req.query.slim) === 'true';
+
+    console.log('Getting generated routes for date:', date, slim ? '(slim — no heavy segments/URLs)' : '');
+
     // Fetch fresh driver data for lookups
     let allDrivers = [];
     try { allDrivers = await getAvailableDriversData(); } catch(e) { allDrivers = MOCK_DRIVERS; }
-    
+
     // Convert routeOrdersMap to array of routes
     const routes = [];
     for (const [routeId, orders] of routeOrdersMap.entries()) {
       if (orders && orders.length > 0) {
-        // Calculate progress for each route
-        const completedCount = orders.filter(order => 
-          orderStatusMap.get(order.id) === 'delivered'
-        ).length;
-        
-        const progressPercentage = Math.round((completedCount / orders.length) * 100);
-        
-        // Calculate REALISTIC progress and metrics for driver routes
+        const completedCount = orders.filter((order) => orderStatusMap.get(order.id) === 'delivered').length;
         const orderCount = orders.length;
-        
-        // Apply same realistic calculations as route generation
-        let realistic_distance_km, realistic_time_minutes;
-        
+        let realistic_distance_km;
+        let realistic_time_minutes;
         if (orderCount <= 3) {
           realistic_distance_km = Math.round((0.3 + (orderCount * 0.2)) * 100) / 100;
           realistic_time_minutes = 3 + (orderCount * 2);
@@ -1917,10 +1909,35 @@ app.get('/api/orders/get-routes', async (req, res) => {
           realistic_distance_km = Math.round((2.5 + (orderCount * 0.1)) * 100) / 100;
           realistic_time_minutes = 25 + (orderCount * 1);
         }
-        
-        // Get route details with realistic metrics
         const assignedDriverId = routeDriverMap.get(routeId) || null;
-        const assignedDriver = assignedDriverId ? allDrivers.find(d => String(d.id) === String(assignedDriverId)) : null;
+        const assignedDriver = assignedDriverId ? allDrivers.find((d) => String(d.id) === String(assignedDriverId)) : null;
+        const status = (() => {
+          if (completedCount === orders.length) return 'completed';
+          if (completedCount > 0) return 'in_route';
+          const anyDispatched = orders.some((o) => orderStatusMap.get(o.id) === 'dispatched');
+          if (anyDispatched) return 'dispatched';
+          if (assignedDriverId) return 'assigned';
+          return 'generated';
+        })();
+
+        // Analytics uses slim=1 — skip nav URLs, route_segments, and copying every order (was freezing browser + stalling the server)
+        if (slim) {
+          routes.push({
+            id: routeId,
+            route_id: routeId,
+            route_name: `Zone ${routeId.split('_')[1]} - ${orders[0]?.postcode?.split(' ')[0] || 'Unknown'}`,
+            driver_id: assignedDriverId,
+            driver_name: assignedDriver ? assignedDriver.name : null,
+            driver_email: assignedDriver ? assignedDriver.email : null,
+            status,
+            total_orders: orderCount,
+            completed_orders: completedCount,
+            estimated_duration_minutes: Math.round(realistic_time_minutes),
+            total_distance_km: realistic_distance_km
+          });
+          continue;
+        }
+
         const routeDetails = {
           id: routeId,
           route_id: routeId,
@@ -1928,27 +1945,20 @@ app.get('/api/orders/get-routes', async (req, res) => {
           driver_id: assignedDriverId,
           driver_name: assignedDriver ? assignedDriver.name : null,
           driver_email: assignedDriver ? assignedDriver.email : null,
-          status: (() => {
-            if (completedCount === orders.length) return 'completed';
-            if (completedCount > 0) return 'in_route';
-            const anyDispatched = orders.some(o => orderStatusMap.get(o.id) === 'dispatched');
-            if (anyDispatched) return 'dispatched';
-            if (assignedDriverId) return 'assigned';
-            return 'generated';
-          })(),
-          total_orders: orders.length,
+          status,
+          total_orders: orderCount,
           completed_orders: completedCount,
           estimated_duration_minutes: Math.round(realistic_time_minutes),
           total_distance_km: realistic_distance_km,
           total_distance_miles: Math.round(realistic_distance_km * 0.621371 * 100) / 100,
-          zone_color: ['#FF6B35', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7'][parseInt(routeId.split('_')[1]) % 5],
-          depot_returns_needed: Math.ceil(orders.length / 15), // More realistic
-          route_efficiency_score: Math.round(Math.min(95, 85 + Math.random() * 10) * 10) / 10,
+          zone_color: ['#FF6B35', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7'][parseInt(routeId.split('_')[1], 10) % 5],
+          depot_returns_needed: Math.ceil(orderCount / 15),
+          route_efficiency_score: Math.round((Math.min(95, 85 + Math.random() * 10) * 10)) / 10,
           navigation_url: (() => {
-            const primaryDepot = MOCK_DEPOTS.find(d => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
+            const primaryDepot = MOCK_DEPOTS.find((d) => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
             const result = generateNavigationURL(
               { latitude: primaryDepot.latitude, longitude: primaryDepot.longitude },
-              orders.map(order => ({
+              orders.map((order) => ({
                 lat: parseFloat(order.latitude) || primaryDepot.latitude,
                 lng: parseFloat(order.longitude) || primaryDepot.longitude
               })),
@@ -1956,26 +1966,28 @@ app.get('/api/orders/get-routes', async (req, res) => {
             );
             return typeof result === 'object' ? result.url : result;
           })(),
-          route_segments: [{
-            orders: orders.map(order => ({
-              ...order,
-              status: orderStatusMap.get(order.id) || 'pending'
-            })),
-            estimated_duration_minutes: Math.round(realistic_time_minutes),
-            total_distance_km: realistic_distance_km,
-            return_to_depot: true
-          }]
+          route_segments: [
+            {
+              orders: orders.map((order) => ({
+                ...order,
+                status: orderStatusMap.get(order.id) || 'pending'
+              })),
+              estimated_duration_minutes: Math.round(realistic_time_minutes),
+              total_distance_km: realistic_distance_km,
+              return_to_depot: true
+            }
+          ]
         };
-        
+
         routes.push(routeDetails);
       }
     }
-    
+
     console.log(`Found ${routes.length} generated routes`);
-    
+
     res.json({
       success: true,
-      routes: routes,
+      routes,
       total_routes: routes.length,
       date: date
     });
@@ -1987,6 +1999,93 @@ app.get('/api/orders/get-routes', async (req, res) => {
       message: 'Failed to fetch routes',
       error: error.message
     });
+  }
+});
+
+/**
+ * Single tiny JSON for the Analytics page — no route_segments, no orders[], no get-routes payload.
+ * Prevents the browser from JSON.parse+GC on multi‑MB responses (the main reason the tab froze).
+ */
+app.get('/api/orders/analytics-snapshot', async (req, res) => {
+  try {
+    const end = (req.query.end && String(req.query.end).slice(0, 10)) || new Date().toISOString().split('T')[0];
+    const start = (req.query.start && String(req.query.start).slice(0, 10)) || end;
+    const activeStatuses = new Set(['dispatched', 'in_progress', 'in_route', 'assigned']);
+    let totalRoutes = 0;
+    let delivered = 0;
+    let totalStops = 0;
+    let durationSum = 0;
+    let dispatched = 0;
+    let completed = 0;
+
+    for (const [routeId, orders] of routeOrdersMap.entries()) {
+      if (!orders?.length) continue;
+      totalRoutes += 1;
+      const orderCount = orders.length;
+      const completedCount = orders.filter((o) => orderStatusMap.get(o.id) === 'delivered').length;
+      totalStops += orderCount;
+      delivered += completedCount;
+      let realistic_time_minutes;
+      if (orderCount <= 3) {
+        realistic_time_minutes = 3 + (orderCount * 2);
+      } else if (orderCount <= 6) {
+        realistic_time_minutes = 8 + (orderCount * 1.5);
+      } else if (orderCount <= 9) {
+        realistic_time_minutes = 15 + (orderCount * 1.2);
+      } else {
+        realistic_time_minutes = 25 + (orderCount * 1);
+      }
+      durationSum += Math.round(realistic_time_minutes);
+      const assignedDriverId = routeDriverMap.get(routeId) || null;
+      const status = (() => {
+        if (completedCount === orders.length) return 'completed';
+        if (completedCount > 0) return 'in_route';
+        const anyDispatched = orders.some((o) => orderStatusMap.get(o.id) === 'dispatched');
+        if (anyDispatched) return 'dispatched';
+        if (assignedDriverId) return 'assigned';
+        return 'generated';
+      })();
+      if (activeStatuses.has(status)) dispatched += 1;
+      if (status === 'completed') completed += 1;
+    }
+    const avgDuration = totalRoutes > 0 ? durationSum / totalRoutes : 0;
+
+    let eligibleCount = 0;
+    if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+      try {
+        const { createClient } = require('@supabase/supabase-js');
+        const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+        const { count, error } = await supabase
+          .from('orders')
+          .select('*', { count: 'exact', head: true })
+          .eq('delivery_date', end)
+          .in('status', ['pending', 'confirmed', 'assigned', 'in_route', 'clustered']);
+        if (error) throw error;
+        eligibleCount = count ?? 0;
+      } catch (err) {
+        console.warn('[analytics-snapshot] eligible count fallback local:', err.message);
+        eligibleCount = Array.isArray(inMemoryOrders) ? inMemoryOrders.length : 0;
+      }
+    } else {
+      eligibleCount = Array.isArray(inMemoryOrders) ? inMemoryOrders.length : 0;
+    }
+
+    return res.json({
+      success: true,
+      range: { start, end },
+      snapshot: {
+        totalRoutes,
+        delivered,
+        totalStops,
+        avgDuration,
+        dispatched,
+        completed,
+      },
+      eligibleCount,
+    });
+  } catch (e) {
+    console.error('analytics-snapshot', e);
+    return res.status(500).json({ success: false, message: e?.message || 'Failed to build snapshot' });
   }
 });
 
@@ -2183,7 +2282,33 @@ async function getAvailableDriversData() {
 
 app.get('/api/orders/eligible', async (req, res) => {
   const { date = new Date().toISOString().split('T')[0] } = req.query;
+  const summaryOnly = String(req.query.summary) === '1' || String(req.query.summary) === 'true';
   try {
+    // Lightweight count for dashboards — avoids multi‑MB JSON (was freezing the Analytics tab)
+    if (summaryOnly) {
+      if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+        try {
+          const { createClient } = require('@supabase/supabase-js');
+          const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+          const { count, error } = await supabase
+            .from('orders')
+            .select('*', { count: 'exact', head: true })
+            .eq('delivery_date', date)
+            .in('status', ['pending', 'confirmed', 'assigned', 'in_route', 'clustered']);
+          if (error) throw error;
+          return res.json({ success: true, total_orders: count ?? 0, date, source: 'supabase' });
+        } catch (dbErr) {
+          console.warn('Supabase count unavailable, using local count:', dbErr.message);
+        }
+      }
+      return res.json({
+        success: true,
+        total_orders: Array.isArray(inMemoryOrders) ? inMemoryOrders.length : 0,
+        date,
+        source: 'local',
+      });
+    }
+
     if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
       try {
         const { createClient } = require('@supabase/supabase-js');
@@ -3159,10 +3284,12 @@ app.use((error, req, res, next) => {
   });
 });
 // Start server - MUST use 0.0.0.0 for Railway
-app.listen(PORT, '0.0.0.0', () => {  // ✅ ADD '0.0.0.0' HERE!
+// Keep a reference to the HTTP server (listen errors, graceful shutdown, debugging "why did Node exit?")
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log('\n🚀 xRuto Standalone Server Started Successfully!');
-  console.log(`📍 Server running on http://0.0.0.0:${PORT}`);  // ✅ Changed to 0.0.0.0
-  console.log(`🔗 Health check: http://0.0.0.0:${PORT}/api/health`);  // ✅ Changed to 0.0.0.0
+  console.log(`📍 Server running on http://0.0.0.0:${PORT}`);
+  console.log(`🔗 Health check: http://0.0.0.0:${PORT}/api/health`);
+  console.log(`🆔 PID ${process.pid} — keep this terminal open while the app runs. Press Ctrl+C to stop.`);
   console.log(`💾 Database: ${process.env.SUPABASE_URL ? 'Supabase Connected' : 'Mock Data Mode'}`);
   console.log('\n📋 Available endpoints:');
   console.log('   GET  /api/health');
@@ -3180,15 +3307,38 @@ app.listen(PORT, '0.0.0.0', () => {  // ✅ ADD '0.0.0.0' HERE!
   console.log('   POST /api/orders/generate-clusters');
   console.log('   POST /api/orders/generate-routes');
   console.log('   GET  /api/orders/get-routes');
+  console.log('   GET  /api/orders/analytics-snapshot');
   console.log('   POST /api/orders/assign-driver');
   console.log('   POST /api/orders/dispatch-routes');
-  console.log('   GET  /api/orders/available-drivers');
+  console.log('   GET /api/orders/available-drivers');
   console.log('   GET  /api/orders/route-details/:routeId');
   console.log('   PUT  /api/orders/delivery-status/:orderId');
   console.log('   POST /api/auth/login');
   console.log('\n✨ Your React frontend should now connect successfully!');
-  console.log('📊 Route-order tracking: Dynamic order management active');
+  console.log('📊 Route-order tracking: Dynamic order management active\n');
+});
+
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE') {
+    console.error(`\n❌ Port ${PORT} is already in use. Stop the other process or set PORT in .env\n`);
+  } else {
+    console.error('\n❌ HTTP server error:', err);
+  }
+  process.exit(1);
+});
+
+process.on('SIGINT', () => {
+  console.log('\nSIGINT — closing server…');
+  server.close(() => {
+    process.exit(0);
+  });
+});
+
+process.on('SIGTERM', () => {
+  server.close(() => {
+    process.exit(0);
+  });
 });
 
 module.exports = app;
-module.exports = app;
+module.exports.server = server;
