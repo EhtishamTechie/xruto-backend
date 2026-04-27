@@ -156,34 +156,42 @@ function persist() {
     users: USERS
   });
 }
-// Middleware - Fixed CORS for Vite and Vercel
+/**
+ * CORS: configure via env so Vercel + Render + local dev work without editing code.
+ * - CLIENT_URL: production frontend (e.g. https://app.vercel.app)
+ * - CORS_EXTRA_ORIGINS: comma-separated list (e.g. https://app.com,https://old.vercel.app)
+ * - CORS_ALLOW_VERCEL: default true — allow any https://*.vercel.app (set to false to lock down)
+ */
+function isCorsOriginAllowed(origin) {
+  if (!origin) return true; // same-origin, curl, some mobile webviews
+  const norm = (u) => String(u).replace(/\/$/, '');
+  const client = norm(process.env.CLIENT_URL || '');
+  if (client && (origin === client || origin.startsWith(`${client}/`))) return true;
+  const extra = String(process.env.CORS_EXTRA_ORIGINS || '')
+    .split(',')
+    .map((s) => norm(s.trim()))
+    .filter(Boolean);
+  for (const e of extra) {
+    if (origin === e || origin.startsWith(`${e}/`)) return true;
+  }
+  if (String(process.env.CORS_ALLOW_VERCEL).toLowerCase() !== 'false') {
+    if (/^https:\/\/[a-z0-9][a-z0-9.-]*\.vercel\.app$/i.test(origin)) return true;
+  }
+  if (/^http:\/\/localhost(?::\d+)?$/i.test(origin) || /^http:\/\/127\.0\.0\.1(?::\d+)?$/i.test(origin)) return true;
+  return false;
+}
+
 app.use(cors({
-  origin: [
-    'https://xruto-frontend.vercel.app',
-    'https://xruto-frontend-1bl2vjf70-ummah-tech-innovation.vercel.app',  // ✅ ADD THIS LINE
-    /^https:\/\/xruto-frontend.*\.vercel\.app$/,  // ✅ ADD THIS LINE - Allows ALL Vercel previews
-    'http://localhost:3000',
-    'http://localhost:5173',
-    'http://localhost:5174',
-    'http://localhost:5175',
-    'http://localhost:5176',
-    'http://localhost:5177',
-    'http://localhost:5178',
-    'http://localhost:5179',
-    'http://localhost:5180',
-    'http://127.0.0.1:5173',
-    'http://127.0.0.1:5174',
-    'http://127.0.0.1:5175',
-    'http://127.0.0.1:5176',
-    'http://127.0.0.1:5177',
-    'http://127.0.0.1:5178',
-    'http://127.0.0.1:5179',
-    'http://127.0.0.1:5180',
-    process.env.CLIENT_URL
-  ].filter(Boolean),
+  origin: (requestOrigin, callback) => {
+    if (isCorsOriginAllowed(requestOrigin)) {
+      return callback(null, true);
+    }
+    console.warn(`[CORS] Blocked origin: ${requestOrigin} (set CLIENT_URL or CORS_EXTRA_ORIGINS)`);
+    return callback(null, false);
+  },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],  // ✅ Added PATCH
-  allowedHeaders: ['Content-Type', 'Authorization']
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -252,8 +260,14 @@ app.get('/api/health', async (req, res) => {
     services: {
       server: 'running',
       database: process.env.SUPABASE_URL ? 'configured' : 'missing',
-      here_api: process.env.HERE_API_KEY ? 'configured' : 'missing'
-    }
+      here_api: process.env.HERE_API_KEY ? 'configured' : 'missing',
+    },
+    config: {
+      supabase: !!(process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY),
+      client_url: process.env.CLIENT_URL ? 'set' : 'default',
+      cors_vercel: String(process.env.CORS_ALLOW_VERCEL).toLowerCase() !== 'false',
+      local_file: true,
+    },
   };
 
   // Test database connection if configured
@@ -358,36 +372,188 @@ app.get('/api/admin/depots', async (req, res) => {
   }
 });
 
+/** Depot lat/lng must not be 0,0 (invalid / “Null Island”) for route URLs. */
+function depotCoordsUsable(lat, lng) {
+  const a = parseFloat(lat);
+  const b = parseFloat(lng);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+  if (Math.abs(a) < 1e-6 && Math.abs(b) < 1e-6) return false;
+  if (Math.abs(a) > 90 || Math.abs(b) > 180) return false;
+  return true;
+}
+
+/** Parse Google Maps URL / text for @lat,lng or !3d!4d (same rules as frontend). */
+function parseLatLngFromGoogleMapsText(input) {
+  if (input == null || typeof input !== 'string') return null;
+  const s = input.trim();
+  if (!s) return null;
+  const tight = s.replace(/\s/g, '');
+  let m = tight.match(/^(-?\d+\.?\d*),(-?\d+\.?\d*)$/);
+  if (m) {
+    const lat = parseFloat(m[1]);
+    const lng = parseFloat(m[2]);
+    if (depotCoordsUsable(lat, lng)) return { latitude: lat, longitude: lng };
+  }
+  m = s.match(/@(-?\d+\.?\d*),(-?\d+\.?\d*)(?:,|\s|\/|\?|#|z|\]|$)/);
+  if (!m) m = s.match(/@(-?\d+\.?\d*),(-?\d+\.?\d+)/);
+  if (m) {
+    const lat = parseFloat(m[1]);
+    const lng = parseFloat(m[2]);
+    if (depotCoordsUsable(lat, lng)) return { latitude: lat, longitude: lng };
+  }
+  m = s.match(/!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)/i);
+  if (m) {
+    const lat = parseFloat(m[1]);
+    const lng = parseFloat(m[2]);
+    if (depotCoordsUsable(lat, lng)) return { latitude: lat, longitude: lng };
+  }
+  m = s.match(/[?&]q=(-?\d+\.?\d*),(-?\d+\.?\d*)\b/);
+  if (m) {
+    const lat = parseFloat(m[1]);
+    const lng = parseFloat(m[2]);
+    if (depotCoordsUsable(lat, lng)) return { latitude: lat, longitude: lng };
+  }
+  m = s.match(/[?&]ll=(-?\d+\.?\d*),(-?\d+\.?\d*)\b/);
+  if (m) {
+    const lat = parseFloat(m[1]);
+    const lng = parseFloat(m[2]);
+    if (depotCoordsUsable(lat, lng)) return { latitude: lat, longitude: lng };
+  }
+  return null;
+}
+
+/** Free geocoding (Nominatim). Set NOMINATIM_USER_AGENT in production per OSM policy. */
+async function geocodeDepotAddress({ name, address, city, postcode }) {
+  const parts = [name, address, city, postcode].filter((x) => x != null && String(x).trim() !== '');
+  const q = parts.join(', ');
+  if (!q.trim()) return null;
+
+  const blob = q.toLowerCase();
+  const isLikelyPakistan =
+    /pakistan|taxila|lahore|islamabad|karachi|rawalpindi|peshawar|quetta|multan|federal|f-?\d|g-?\d|h-?\d|e-?\d|470\d{2}|54\d{3}\b|75\d{3}\b|44\d{3}\b/i.test(
+      blob
+    );
+
+  const attempts = [];
+  if (isLikelyPakistan) {
+    attempts.push({ q, countrycodes: 'pk' });
+    const addr = [address, city].filter(Boolean).join(', ');
+    if (addr) attempts.push({ q: `${addr}, Pakistan`, countrycodes: 'pk' });
+  } else {
+    attempts.push({ q, countrycodes: null });
+  }
+
+  for (let i = 0; i < attempts.length; i++) {
+    if (i > 0) {
+      try {
+        await new Promise((r) => setTimeout(r, 1100));
+      } catch (e) {
+        /* ignore */
+      }
+    }
+    const { q: query, countrycodes } = attempts[i];
+    try {
+      const params = new URLSearchParams({ format: 'json', q: query, limit: '1' });
+      if (countrycodes) params.set('countrycodes', countrycodes);
+      const url = `https://nominatim.openstreetmap.org/search?${params.toString()}`;
+      const res = await fetch(url, {
+        headers: {
+          Accept: 'application/json',
+          'Accept-Language': 'en',
+          'User-Agent': process.env.NOMINATIM_USER_AGENT || 'Xruto/1.0 (depot geocoding; contact admin)',
+        },
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (!Array.isArray(data) || !data[0]) continue;
+      const lat = parseFloat(data[0].lat);
+      const lng = parseFloat(data[0].lon);
+      if (depotCoordsUsable(lat, lng)) return { latitude: lat, longitude: lng };
+    } catch (e) {
+      console.warn('Depot geocode error:', e.message);
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolves stored coordinates: explicit lat/lng, else geocode from address, else optional fallback depot.
+ * @returns {Promise<{ latitude: number, longitude: number, geocoded?: boolean, fromMapLink?: boolean } | null>}
+ */
+async function resolveDepotLatLng(
+  { name, address, city, postcode, latitude, longitude, googleMapsUrl },
+  allowFallbackTo
+) {
+  const latIn = latitude != null && String(latitude).trim() !== '' ? parseFloat(latitude) : NaN;
+  const lngIn = longitude != null && String(longitude).trim() !== '' ? parseFloat(longitude) : NaN;
+  if (depotCoordsUsable(latIn, lngIn)) {
+    return { latitude: latIn, longitude: lngIn };
+  }
+  const fromLink = parseLatLngFromGoogleMapsText(googleMapsUrl);
+  if (fromLink) {
+    return { latitude: fromLink.latitude, longitude: fromLink.longitude, fromMapLink: true };
+  }
+  const geo = await geocodeDepotAddress({ name, address, city, postcode });
+  if (geo && depotCoordsUsable(geo.latitude, geo.longitude)) {
+    return { latitude: geo.latitude, longitude: geo.longitude, geocoded: true };
+  }
+  if (allowFallbackTo && depotCoordsUsable(allowFallbackTo.latitude, allowFallbackTo.longitude)) {
+    return { latitude: parseFloat(allowFallbackTo.latitude), longitude: parseFloat(allowFallbackTo.longitude) };
+  }
+  return null;
+}
+
 app.post('/api/admin/depots', async (req, res) => {
   try {
     console.log('Adding depot:', req.body);
     
-    const { name, address, city, postcode, capacity, contactPhone, contactEmail, latitude, longitude } = req.body;
+    const { name, address, city, postcode, capacity, contactPhone, contactEmail, latitude, longitude, googleMapsUrl } = req.body;
 
-    if (!name || !address) {
+    const _primaryDepot = MOCK_DEPOTS.find((d) => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
+    const nm = name && String(name).trim();
+    const addr = address != null && String(address).trim() !== '' ? String(address).trim() : '';
+    const c = city ? city.trim() : '';
+    const pc = postcode ? postcode.trim() : '';
+
+    if (!nm) {
       return res.status(400).json({
         success: false,
-        message: 'Name and address are required'
+        message: 'Depot name is required',
+      });
+    }
+    const latTry = latitude != null && String(latitude).trim() !== '' ? parseFloat(latitude) : NaN;
+    const lngTry = longitude != null && String(longitude).trim() !== '' ? parseFloat(longitude) : NaN;
+    if (!addr && !depotCoordsUsable(latTry, lngTry) && !parseLatLngFromGoogleMapsText(googleMapsUrl)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Add a street address, or paste a Google Maps link, or enter latitude and longitude.',
       });
     }
 
-    const _primaryDepot = MOCK_DEPOTS.find(d => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
+    const resolved = await resolveDepotLatLng(
+      { name: nm, address: addr, city: c, postcode: pc, latitude, longitude, googleMapsUrl },
+      _primaryDepot
+    );
+    if (!resolved) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'Could not set depot on the map. Paste a Google Maps link (Share → copy link) in the "Map link" field, or enter latitude and longitude, or a full address we can look up.',
+      });
+    }
 
     if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
       try {
         const { createClient } = require('@supabase/supabase-js');
         const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
-        
-        let finalLat = latitude || _primaryDepot.latitude;
-        let finalLng = longitude || _primaryDepot.longitude;
 
         const depotData = {
-          name: name.trim(),
-          address: address.trim(),
-          city: city ? city.trim() : null,
-          postcode: postcode ? postcode.trim() : null,
-          latitude: parseFloat(finalLat),
-          longitude: parseFloat(finalLng),
+          name: nm,
+          address: addr,
+          city: c || null,
+          postcode: pc || null,
+          latitude: resolved.latitude,
+          longitude: resolved.longitude,
           capacity: capacity ? parseInt(capacity) : 500,
           contact_phone: contactPhone ? contactPhone.trim() : null,
           contact_email: contactEmail ? contactEmail.trim() : null,
@@ -405,7 +571,11 @@ app.post('/api/admin/depots', async (req, res) => {
 
         return res.status(201).json({
           success: true,
-          message: 'Depot added successfully',
+          message: resolved.fromMapLink
+            ? 'Depot added; coordinates taken from the map link'
+            : resolved.geocoded
+              ? 'Depot added; coordinates set from your address'
+              : 'Depot added successfully',
           depot: {
             ...depot,
             driver_count: 0,
@@ -419,12 +589,12 @@ app.post('/api/admin/depots', async (req, res) => {
 
     const memoryDepot = {
       id: Date.now().toString(),
-      name: name.trim(),
-      address: address.trim(),
-      city: city ? city.trim() : '',
-      postcode: postcode ? postcode.trim() : '',
-      latitude: latitude ? parseFloat(latitude) : (_primaryDepot ? _primaryDepot.latitude : 0),
-      longitude: longitude ? parseFloat(longitude) : (_primaryDepot ? _primaryDepot.longitude : 0),
+      name: nm,
+      address: addr,
+      city: c,
+      postcode: pc,
+      latitude: resolved.latitude,
+      longitude: resolved.longitude,
       capacity: capacity ? parseInt(capacity) : 500,
       contact_phone: contactPhone ? contactPhone.trim() : '',
       contact_email: contactEmail ? contactEmail.trim() : '',
@@ -435,7 +605,15 @@ app.post('/api/admin/depots', async (req, res) => {
     };
     MOCK_DEPOTS.push(memoryDepot);
     persist();
-    res.status(201).json({ success: true, message: 'Depot added (memory mode)', depot: memoryDepot });
+    res.status(201).json({
+      success: true,
+      message: resolved.fromMapLink
+        ? 'Depot added; coordinates from map link (memory mode)'
+        : resolved.geocoded
+          ? 'Depot added; coordinates set from your address (memory mode)'
+          : 'Depot added (memory mode)',
+      depot: memoryDepot
+    });
   } catch (error) {
     console.error('Add depot error:', error);
     res.status(500).json({
@@ -449,23 +627,45 @@ app.post('/api/admin/depots', async (req, res) => {
 app.put('/api/admin/depots/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, address, city, postcode, capacity, contactPhone, contactEmail, latitude, longitude, is_active } = req.body;
+    const { name, address, city, postcode, capacity, contactPhone, contactEmail, latitude, longitude, is_active, googleMapsUrl } = req.body;
 
     if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
       try {
         const { createClient } = require('@supabase/supabase-js');
         const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+        const { data: current, error: fetchErr } = await supabase.from('depots').select('*').eq('id', id).single();
+        if (fetchErr) throw fetchErr;
+        if (!current) {
+          return res.status(404).json({ success: false, message: 'Depot not found' });
+        }
+        const merged = {
+          name: name !== undefined ? name : current.name,
+          address: address !== undefined ? address : current.address,
+          city: city !== undefined ? city : current.city,
+          postcode: postcode !== undefined ? postcode : current.postcode,
+          latitude: latitude !== undefined ? latitude : current.latitude,
+          longitude: longitude !== undefined ? longitude : current.longitude,
+          googleMapsUrl: googleMapsUrl !== undefined ? googleMapsUrl : undefined,
+        };
+        const resolved = await resolveDepotLatLng(merged, null);
+        if (!resolved) {
+          return res.status(400).json({
+            success: false,
+            message:
+              'Could not set depot on the map. Paste a Google Maps link, or add latitude and longitude, or a findable address.',
+          });
+        }
         const updateData = {
-          name: name,
-          address: address,
-          city: city,
-          postcode: postcode,
-          capacity: capacity ? parseInt(capacity) : undefined,
-          contact_phone: contactPhone,
-          contact_email: contactEmail,
-          latitude: latitude !== undefined ? parseFloat(latitude) : undefined,
-          longitude: longitude !== undefined ? parseFloat(longitude) : undefined,
-          is_active: is_active,
+          name: merged.name,
+          address: merged.address,
+          city: merged.city,
+          postcode: merged.postcode,
+          capacity: capacity ? parseInt(capacity) : current.capacity,
+          contact_phone: contactPhone !== undefined ? contactPhone : current.contact_phone,
+          contact_email: contactEmail !== undefined ? contactEmail : current.contact_email,
+          latitude: resolved.latitude,
+          longitude: resolved.longitude,
+          is_active: is_active !== undefined ? Boolean(is_active) : current.is_active,
           updated_at: new Date().toISOString()
         };
         const { data, error } = await supabase
@@ -475,7 +675,15 @@ app.put('/api/admin/depots/:id', async (req, res) => {
           .select()
           .single();
         if (error) throw error;
-        return res.json({ success: true, message: 'Depot updated successfully', depot: data });
+        return res.json({
+          success: true,
+          message: resolved.fromMapLink
+            ? 'Depot updated; coordinates taken from the map link'
+            : resolved.geocoded
+              ? 'Depot updated; coordinates set from your address'
+              : 'Depot updated successfully',
+          depot: data
+        });
       } catch (dbErr) {
         console.warn('Depot update DB unavailable, using memory fallback:', dbErr.message);
       }
@@ -483,22 +691,48 @@ app.put('/api/admin/depots/:id', async (req, res) => {
 
     const idx = MOCK_DEPOTS.findIndex(d => String(d.id) === String(id));
     if (idx < 0) return res.status(404).json({ success: false, message: 'Depot not found' });
+    const ex = MOCK_DEPOTS[idx];
+    const merged = {
+      name: name !== undefined ? name : ex.name,
+      address: address !== undefined ? address : ex.address,
+      city: city !== undefined ? city : ex.city,
+      postcode: postcode !== undefined ? postcode : ex.postcode,
+      latitude: latitude !== undefined ? latitude : ex.latitude,
+      longitude: longitude !== undefined ? longitude : ex.longitude,
+      googleMapsUrl: googleMapsUrl !== undefined ? googleMapsUrl : undefined,
+    };
+    const _fb = MOCK_DEPOTS.find((d) => d.is_primary && String(d.id) !== String(id)) || MOCK_DEPOTS.find((d) => String(d.id) !== String(id));
+    const resolved = await resolveDepotLatLng(merged, _fb);
+    if (!resolved) {
+      return res.status(400).json({
+        success: false,
+        message:
+          'Could not set depot on the map. Paste a Google Maps link, or add latitude and longitude, or a findable address.',
+      });
+    }
     MOCK_DEPOTS[idx] = {
-      ...MOCK_DEPOTS[idx],
-      name: name ?? MOCK_DEPOTS[idx].name,
-      address: address ?? MOCK_DEPOTS[idx].address,
-      city: city ?? MOCK_DEPOTS[idx].city,
-      postcode: postcode ?? MOCK_DEPOTS[idx].postcode,
-      capacity: capacity !== undefined ? parseInt(capacity) : MOCK_DEPOTS[idx].capacity,
-      contact_phone: contactPhone ?? MOCK_DEPOTS[idx].contact_phone,
-      contact_email: contactEmail ?? MOCK_DEPOTS[idx].contact_email,
-      latitude: latitude !== undefined ? parseFloat(latitude) : MOCK_DEPOTS[idx].latitude,
-      longitude: longitude !== undefined ? parseFloat(longitude) : MOCK_DEPOTS[idx].longitude,
-      longitude: longitude !== undefined ? parseFloat(longitude) : MOCK_DEPOTS[idx].longitude,
-      is_active: is_active !== undefined ? Boolean(is_active) : MOCK_DEPOTS[idx].is_active
+      ...ex,
+      name: merged.name,
+      address: merged.address,
+      city: merged.city,
+      postcode: merged.postcode,
+      capacity: capacity !== undefined ? parseInt(capacity) : ex.capacity,
+      contact_phone: contactPhone !== undefined ? contactPhone : ex.contact_phone,
+      contact_email: contactEmail !== undefined ? contactEmail : ex.contact_email,
+      latitude: resolved.latitude,
+      longitude: resolved.longitude,
+      is_active: is_active !== undefined ? Boolean(is_active) : ex.is_active
     };
     persist();
-    res.json({ success: true, message: 'Depot updated successfully', depot: MOCK_DEPOTS[idx] });
+    res.json({
+      success: true,
+      message: resolved.fromMapLink
+        ? 'Depot updated; coordinates taken from the map link'
+        : resolved.geocoded
+          ? 'Depot updated; coordinates set from your address'
+          : 'Depot updated successfully',
+      depot: MOCK_DEPOTS[idx]
+    });
   } catch (error) {
     console.error('Update depot error:', error);
     res.status(500).json({ success: false, message: 'Failed to update depot', error: error.message });
@@ -1098,6 +1332,166 @@ function performKMeansClustering(orders, numClusters = 3) {
 }
 // Add these helper functions after performKMeansClustering function (around line 200)
 
+/** 0,0 (Null Island) and invalid floats break Google Maps; browser geolocation is never used in these URLs. */
+function isNullIsland(lat, lng) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return true;
+  if (Math.abs(lat) < 1e-6 && Math.abs(lng) < 1e-6) return true;
+  return false;
+}
+
+function isValidNavCoord(lat, lng) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return false;
+  if (isNullIsland(lat, lng)) return false;
+  if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return false;
+  return true;
+}
+
+function getLatLngFromWaypoint(wp) {
+  if (!wp) return null;
+  const la = wp.lat != null && wp.lat !== '' ? parseFloat(wp.lat) : parseFloat(wp.latitude);
+  const ln = wp.lng != null && wp.lng !== '' ? parseFloat(wp.lng) : parseFloat(wp.longitude);
+  if (isValidNavCoord(la, ln)) return { lat: la, lng: ln, _meta: wp };
+  return null;
+}
+
+function getDepotPointForNav(depot) {
+  const la = parseFloat(depot?.latitude);
+  const ln = parseFloat(depot?.longitude);
+  if (isValidNavCoord(la, ln)) return { lat: la, lng: ln };
+  return null;
+}
+
+function pickPrimaryDepotFromList(depots) {
+  if (!depots || depots.length === 0) return { latitude: 0, longitude: 0 };
+  return depots.find((d) => d.is_primary) || depots[0];
+}
+
+/** Union memory + Supabase depots so local-only depots (e.g. UET Taxila in db.json) still resolve in nav URLs. */
+function mergeDepotsForNavigation(localDepots, remoteDepots) {
+  const byId = new Map();
+  const add = (row) => {
+    if (!row || row.id == null) return;
+    const id = String(row.id);
+    const cur = byId.get(id);
+    if (!cur) {
+      byId.set(id, row);
+      return;
+    }
+    const curLat = parseFloat(cur.latitude);
+    const curLng = parseFloat(cur.longitude);
+    const nextLat = parseFloat(row.latitude);
+    const nextLng = parseFloat(row.longitude);
+    const curOk = isValidNavCoord(curLat, curLng);
+    const nextOk = isValidNavCoord(nextLat, nextLng);
+    if (nextOk) {
+      byId.set(id, { ...cur, ...row });
+    } else if (!curOk) {
+      byId.set(id, { ...cur, ...row });
+    }
+  };
+  (localDepots || []).forEach(add);
+  (remoteDepots || []).forEach(add);
+  return Array.from(byId.values());
+}
+
+/** Active depots for map URLs: merge persisted MOCK_DEPOTS with DB so IDs from Admin always resolve. */
+async function getDepotsListForNavigation() {
+  if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+    try {
+      const { createClient } = require('@supabase/supabase-js');
+      const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+      const { data: depots, error } = await supabase
+        .from('depots')
+        .select('id, latitude, longitude, is_primary')
+        .eq('is_active', true);
+      if (!error && Array.isArray(depots) && depots.length > 0) {
+        return mergeDepotsForNavigation(MOCK_DEPOTS, depots);
+      }
+    } catch (e) {
+      console.warn('getDepotsListForNavigation:', e.message);
+    }
+  }
+  return MOCK_DEPOTS;
+}
+
+/** Merged id → depot_id for drivers. Supabase null must not wipe a good depot_id from memory (db.json). */
+async function buildDriverDepotIdMap() {
+  const m = new Map();
+  for (const d of MOCK_DRIVERS) {
+    const id = String(d.id);
+    if (d.depot_id != null && d.depot_id !== '') m.set(id, d.depot_id);
+  }
+  if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+    try {
+      const { createClient } = require('@supabase/supabase-js');
+      const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+      const { data: rows, error } = await supabase.from('drivers').select('id, depot_id');
+      if (!error && rows) {
+        for (const r of rows) {
+          const id = String(r.id);
+          if (r.depot_id != null && r.depot_id !== '') m.set(id, r.depot_id);
+        }
+      }
+    } catch (e) {
+      console.warn('buildDriverDepotIdMap:', e.message);
+    }
+  }
+  return m;
+}
+
+/**
+ * Depot for start/end in /maps URLs — prefer the assigned driver’s depot, not the global primary
+ * (e.g. Warrington primary vs UET Taxila for a Pakistan run).
+ */
+function getDepotForNavigation(assignedDriverId, depots, driverDepotIdMap) {
+  const list = depots && depots.length ? depots : MOCK_DEPOTS;
+  const primary = pickPrimaryDepotFromList(list);
+  if (!assignedDriverId) return primary;
+  const depotId = driverDepotIdMap
+    ? driverDepotIdMap.get(String(assignedDriverId))
+    : (MOCK_DRIVERS.find((d) => String(d.id) === String(assignedDriverId)) || {}).depot_id;
+  if (depotId == null || depotId === '') return primary;
+  let d = (list || []).find((x) => String(x.id) === String(depotId));
+  if (!d) d = MOCK_DEPOTS.find((x) => String(x.id) === String(depotId));
+  if (d && isValidNavCoord(parseFloat(d.latitude), parseFloat(d.longitude))) {
+    return d;
+  }
+  return primary;
+}
+
+function buildNavigationUrlForRouteWithMaps(routeId, driverId, depotsNav, driverDepotIdMap, useGoogleMaps) {
+  const orders = routeOrdersMap.get(routeId) || [];
+  const navDepot = getDepotForNavigation(driverId, depotsNav, driverDepotIdMap);
+  const wps = orders.map((o) => waypointFromOrderForNav(o, navDepot)).filter(Boolean);
+  const result = generateNavigationURL(
+    { latitude: navDepot.latitude, longitude: navDepot.longitude },
+    wps,
+    useGoogleMaps
+  );
+  return typeof result === 'object' ? result.url : result;
+}
+
+/** Build nav waypoint from order + depot; never uses 0,0 as a real coordinate. */
+function waypointFromOrderForNav(order, primaryDepot) {
+  const la = parseFloat(order.latitude);
+  const ln = parseFloat(order.longitude);
+  if (isValidNavCoord(la, ln)) {
+    return { lat: la, lng: ln, orderId: order.id, postcode: order.postcode };
+  }
+  const da = parseFloat(primaryDepot?.latitude);
+  const dl = parseFloat(primaryDepot?.longitude);
+  if (isValidNavCoord(da, dl)) {
+    return { lat: da, lng: dl, orderId: order.id, postcode: order.postcode };
+  }
+  return null;
+}
+
+function buildUniquePoints(points) {
+  return points.filter((p, index, arr) => {
+    return index === arr.findIndex((o) => Math.abs(o.lat - p.lat) < 0.00001 && Math.abs(o.lng - p.lng) < 0.00001);
+  });
+}
+
 function generateNavigationURL(depot, waypoints, useGoogleMaps = false) {
   if (!waypoints || waypoints.length === 0) {
     return {
@@ -1106,108 +1500,98 @@ function generateNavigationURL(depot, waypoints, useGoogleMaps = false) {
     };
   }
 
-  console.log(`🗺️ Generating navigation URL for ${waypoints.length} waypoints`);
+  const rawPoints = (waypoints || []).map((w) => getLatLngFromWaypoint(w)).filter(Boolean);
+  if (rawPoints.length === 0) {
+    console.warn('🗺️ No valid non-zero coordinates for waypoints; depot may be unset (0,0) and orders lack lat/lng.');
+    return {
+      url: useGoogleMaps ? 'https://maps.google.com/' : 'https://wego.here.com/',
+      stats: { original: waypoints.length, unique: 0, duplicates: 0, expected_points: 0 }
+    };
+  }
+
+  const uniqueWaypoints = buildUniquePoints(rawPoints.map((p) => ({ lat: p.lat, lng: p.lng })));
+  const duplicates = rawPoints.length - uniqueWaypoints.length;
+  const depotPt = getDepotPointForNav(depot);
+  const useDepot = !!depotPt;
+  const origin = depotPt || uniqueWaypoints[0];
+  const returnPt = depotPt || uniqueWaypoints[0];
+  if (!isValidNavCoord(origin.lat, origin.lng)) {
+    return {
+      url: useGoogleMaps ? 'https://maps.google.com/' : 'https://wego.here.com/',
+      stats: { original: waypoints.length, unique: 0, duplicates, expected_points: 0 }
+    };
+  }
+
+  const o = `${origin.lat},${origin.lng}`;
+  const r = `${returnPt.lat},${returnPt.lng}`;
+
+  console.log(
+    `🗺️ Generating navigation URL: ${uniqueWaypoints.length} unique stops, depot ${useDepot ? 'ok' : 'missing — using first stop as start/end'}`
+  );
 
   if (useGoogleMaps) {
-    const origin = `${depot.latitude},${depot.longitude}`;
-    
-    if (waypoints.length === 1) {
-      const destination = `${waypoints[0].lat || waypoints[0].latitude},${waypoints[0].lng || waypoints[0].longitude}`;
-      const url = `https://www.google.com/maps/dir/${origin}/${destination}`;
-      console.log(`📍 Single waypoint URL: ${url}`);
-      return {
-        url: url,
-        stats: { original: 1, unique: 1, duplicates: 0, expected_points: 3 }
-      };
-    } else {
-      const uniqueWaypoints = waypoints.filter((wp, index, arr) => {
-        const lat = wp.lat || wp.latitude;
-        const lng = wp.lng || wp.longitude;
-        return index === arr.findIndex(w => {
-          const wLat = w.lat || w.latitude;
-          const wLng = w.lng || w.longitude;
-          return Math.abs(wLat - lat) < 0.00001 && Math.abs(wLng - lng) < 0.00001;
-        });
-      });
-      
-      const duplicates = waypoints.length - uniqueWaypoints.length;
-      console.log(`🔍 Original waypoints: ${waypoints.length}, Unique waypoints: ${uniqueWaypoints.length}`);
-      if (duplicates > 0) {
-        console.log(`⚠️  Found ${duplicates} duplicate coordinates!`);
-        waypoints.forEach((wp, index) => {
-          const lat = wp.lat || wp.latitude;
-          const lng = wp.lng || wp.longitude;
-          const duplicateIndex = waypoints.findIndex((other, otherIndex) => {
-            if (otherIndex >= index) return false;
-            const otherLat = other.lat || other.latitude;
-            const otherLng = other.lng || other.longitude;
-            return Math.abs(otherLat - lat) < 0.00001 && Math.abs(otherLng - lng) < 0.00001;
-          });
-          if (duplicateIndex >= 0) {
-            console.log(`🔄 Order ${wp.orderId?.substring(0,8)} (${wp.postcode}) has same coordinates as Order ${waypoints[duplicateIndex].orderId?.substring(0,8)}`);
-          }
-        });
+    if (uniqueWaypoints.length === 1) {
+      const d = uniqueWaypoints[0];
+      const dest = `${d.lat},${d.lng}`;
+      const url = `https://www.google.com/maps/dir/${o}/${dest}`;
+      if (!useDepot) {
+        if (d.lat === origin.lat && d.lng === origin.lng) {
+          // Single stop, no depot: open place directly (avoids 0,0 and odd A→A)
+          return {
+            url: `https://www.google.com/maps/search/?api=1&query=${d.lat},${d.lng}`,
+            stats: { original: 1, unique: 1, duplicates: 0, expected_points: 1 }
+          };
+        }
       }
-      
-      const waypointCoords = uniqueWaypoints
-        .map(wp => `${wp.lat || wp.latitude},${wp.lng || wp.longitude}`)
-        .join('/');
-      
-      const url = `https://www.google.com/maps/dir/${origin}/${waypointCoords}/${origin}`;
-      const expectedPoints = uniqueWaypoints.length + 2;
-      
-      console.log(`📍 Multi-waypoint URL with ${uniqueWaypoints.length} unique stops:`);
-      console.log(`🎯 Route structure: DEPOT → ${uniqueWaypoints.length} deliveries → DEPOT`);
-      console.log(`📊 Expected total points: ${expectedPoints} (${uniqueWaypoints.length} deliveries + 2 depot points)`);
-      console.log(`📏 URL length: ${url.length} characters`);
-      
       return {
-        url: url,
-        stats: { 
-          original: waypoints.length, 
-          unique: uniqueWaypoints.length, 
-          duplicates: duplicates, 
-          expected_points: expectedPoints
-        }
-      };
-    }
-  } else {
-    const origin = `${depot.latitude},${depot.longitude}`;
-    
-    if (waypoints.length === 1) {
-      const destination = `${waypoints[0].lat || waypoints[0].latitude},${waypoints[0].lng || waypoints[0].longitude}`;
-      const url = `https://wego.here.com/directions/drive/${origin}/${destination}`;
-      console.log('Generated HERE Maps URL:', url);
-      return {
-        url: url,
+        url,
         stats: { original: 1, unique: 1, duplicates: 0, expected_points: 3 }
       };
-    } else {
-      const uniqueWaypoints = waypoints.filter((wp, index, arr) => {
-        const lat = wp.lat || wp.latitude;
-        const lng = wp.lng || wp.longitude;
-        return index === arr.findIndex(w => {
-          const wLat = w.lat || w.latitude;
-          const wLng = w.lng || w.longitude;
-          return Math.abs(wLat - lat) < 0.00001 && Math.abs(wLng - lng) < 0.00001;
-        });
-      });
-      const duplicates = waypoints.length - uniqueWaypoints.length;
-      const waypointCoords = uniqueWaypoints
-        .map(wp => `${wp.lat || wp.latitude},${wp.lng || wp.longitude}`)
-        .join('/');
-      const url = `https://wego.here.com/directions/drive/${origin}/${waypointCoords}/${origin}`;
-      console.log('Generated HERE Maps multi-waypoint URL:', url);
+    }
+    if (!useDepot) {
+      const pathParts = uniqueWaypoints.map((p) => `${p.lat},${p.lng}`).join('/');
+      const url = `https://www.google.com/maps/dir/${pathParts}/${r}`;
       return {
-        url: url,
-        stats: {
-          original: waypoints.length,
-          unique: uniqueWaypoints.length,
-          duplicates: duplicates,
-          expected_points: uniqueWaypoints.length + 2
-        }
+        url,
+        stats: { original: waypoints.length, unique: uniqueWaypoints.length, duplicates, expected_points: uniqueWaypoints.length + 1 }
       };
     }
+    const waypointCoords = uniqueWaypoints.map((wp) => `${wp.lat},${wp.lng}`).join('/');
+    const url = `https://www.google.com/maps/dir/${o}/${waypointCoords}/${r}`;
+    if (duplicates > 0) {
+      console.log(`🔍 Deduplicated ${duplicates} same-coordinate stops.`);
+    }
+    return {
+      url,
+      stats: { original: waypoints.length, unique: uniqueWaypoints.length, duplicates, expected_points: uniqueWaypoints.length + 2 }
+    };
+  } else {
+    if (uniqueWaypoints.length === 1) {
+      const d = uniqueWaypoints[0];
+      if (!useDepot && d.lat === origin.lat && d.lng === origin.lng) {
+        return {
+          url: `https://wego.here.com/search/${d.lat},${d.lng}`,
+          stats: { original: 1, unique: 1, duplicates: 0, expected_points: 1 }
+        };
+      }
+      const dest = `${d.lat},${d.lng}`;
+      const url = `https://wego.here.com/directions/drive/${o}/${dest}`;
+      return { url, stats: { original: 1, unique: 1, duplicates: 0, expected_points: 3 } };
+    }
+    if (!useDepot) {
+      const pathParts = uniqueWaypoints.map((p) => `${p.lat},${p.lng}`).join('/');
+      const url = `https://wego.here.com/directions/drive/${pathParts}/${r}`;
+      return {
+        url,
+        stats: { original: waypoints.length, unique: uniqueWaypoints.length, duplicates, expected_points: uniqueWaypoints.length + 1 }
+      };
+    }
+    const waypointCoords = uniqueWaypoints.map((wp) => `${wp.lat},${wp.lng}`).join('/');
+    const url = `https://wego.here.com/directions/drive/${o}/${waypointCoords}/${r}`;
+    return {
+      url,
+      stats: { original: waypoints.length, unique: uniqueWaypoints.length, duplicates, expected_points: uniqueWaypoints.length + 2 }
+    };
   }
 }
 
@@ -1216,17 +1600,15 @@ function generateSimpleNavigationURL(depot, waypoints, useGoogleMaps = false) {
     return useGoogleMaps ? 'https://maps.google.com/' : 'https://wego.here.com/';
   }
 
-  const firstDestination = waypoints[0];
-  
-  if (useGoogleMaps) {
-    const lat = firstDestination.lat || firstDestination.latitude;
-    const lng = firstDestination.lng || firstDestination.longitude;
-    return `https://www.google.com/maps/search/${lat},${lng}`;
-  } else {
-    const lat = firstDestination.lat || firstDestination.latitude;
-    const lng = firstDestination.lng || firstDestination.longitude;
-    return `https://wego.here.com/search/${lat},${lng}`;
+  const p = getLatLngFromWaypoint(waypoints[0]);
+  if (!p) {
+    return useGoogleMaps ? 'https://maps.google.com/' : 'https://wego.here.com/';
   }
+
+  if (useGoogleMaps) {
+    return `https://www.google.com/maps/search/${p.lat},${p.lng}`;
+  }
+  return `https://wego.here.com/search/${p.lat},${p.lng}`;
 }
 
 // ===== PDF UPLOAD ENDPOINT =====
@@ -1781,15 +2163,21 @@ app.post('/api/orders/generate-routes', async (req, res) => {
       }
       const depotReturnsCount = route_segments.length; // every segment returns to depot
 
-      // Generate navigation URL with detailed stats
+      // Generate navigation URL with detailed stats (never 0,0: unset depot + bad fallback breaks Google Maps)
+      const navWaypoints = (zone.orders || [])
+        .map((order, index) => {
+          const wp = waypointFromOrderForNav(order, primaryDepot);
+          if (wp) {
+            console.log(`🗂️ Order ${index + 1}: ID=${order.id?.substring(0, 8)}, postcode=${order.postcode}, coords=${wp.lat},${wp.lng}`);
+          } else {
+            console.warn(`🗂️ Order ${index + 1}: skip nav — no valid order coords and depot has no valid lat/lng (set primary depot on map in Admin).`);
+          }
+          return wp;
+        })
+        .filter(Boolean);
       const navigationResult = generateNavigationURL(
         { latitude: primaryDepot.latitude, longitude: primaryDepot.longitude },
-        (zone.orders?.map((order, index) => {
-          const lat = parseFloat(order.latitude) || primaryDepot.latitude;
-          const lng = parseFloat(order.longitude) || primaryDepot.longitude;
-          console.log(`🗂️ Order ${index + 1}: ID=${order.id?.substring(0,8)}, postcode=${order.postcode}, coords=${lat},${lng}`);
-          return { lat, lng, orderId: order.id, postcode: order.postcode };
-        }) || []),
+        navWaypoints,
         useGoogleMaps
       );
 
@@ -1888,6 +2276,9 @@ app.get('/api/orders/get-routes', async (req, res) => {
     let allDrivers = [];
     try { allDrivers = await getAvailableDriversData(); } catch(e) { allDrivers = MOCK_DRIVERS; }
 
+    const depotsNav = await getDepotsListForNavigation();
+    const driverDepotIdMap = await buildDriverDepotIdMap();
+
     // Convert routeOrdersMap to array of routes
     const routes = [];
     for (const [routeId, orders] of routeOrdersMap.entries()) {
@@ -1955,13 +2346,11 @@ app.get('/api/orders/get-routes', async (req, res) => {
           depot_returns_needed: Math.ceil(orderCount / 15),
           route_efficiency_score: Math.round((Math.min(95, 85 + Math.random() * 10) * 10)) / 10,
           navigation_url: (() => {
-            const primaryDepot = MOCK_DEPOTS.find((d) => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
+            const navDepot = getDepotForNavigation(assignedDriverId, depotsNav, driverDepotIdMap);
+            const wps = orders.map((o) => waypointFromOrderForNav(o, navDepot)).filter(Boolean);
             const result = generateNavigationURL(
-              { latitude: primaryDepot.latitude, longitude: primaryDepot.longitude },
-              orders.map((order) => ({
-                lat: parseFloat(order.latitude) || primaryDepot.latitude,
-                lng: parseFloat(order.longitude) || primaryDepot.longitude
-              })),
+              { latitude: navDepot.latitude, longitude: navDepot.longitude },
+              wps,
               true
             );
             return typeof result === 'object' ? result.url : result;
@@ -2102,10 +2491,21 @@ app.post('/api/orders/assign-driver', async (req, res) => {
 
     console.log('Assigning driver', driver_id, 'to route', route_id);
 
-    // Get driver details
+    // Get driver details (include MOCK_DRIVERS — getAvailableDriversData can omit unavailable-today drivers)
     const drivers = await getAvailableDriversData();
-    const driver = drivers.find(d => d.id === driver_id);
-    
+    let driver = drivers.find((d) => String(d.id) === String(driver_id));
+    if (!driver) {
+      const fromMock = MOCK_DRIVERS.find((d) => String(d.id) === String(driver_id));
+      if (fromMock) {
+        driver = {
+          id: fromMock.id,
+          name: fromMock.name || `${fromMock.first_name || ''} ${fromMock.last_name || ''}`.trim(),
+          email: fromMock.email,
+          mpg: fromMock.mpg || 30,
+          depot_id: fromMock.depot_id,
+        };
+      }
+    }
     if (!driver) {
       return res.status(404).json({
         success: false,
@@ -2117,14 +2517,38 @@ app.post('/api/orders/assign-driver', async (req, res) => {
     routeDriverMap.set(route_id, driver_id);
     persist();
 
+    let routeSettings = { ...inMemorySettings };
+    if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+      try {
+        const { createClient } = require('@supabase/supabase-js');
+        const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+        const { data: dbSettings } = await supabase.from('settings').select('*').single();
+        routeSettings = { ...routeSettings, ...(dbSettings || {}) };
+      } catch (settingsErr) {
+        console.warn('assign-driver settings DB unavailable:', settingsErr.message);
+      }
+    }
+    const useGoogleMaps = routeSettings.navigation_app_preference === 'google';
+    const depotsNavAd = await getDepotsListForNavigation();
+    const driverDepotIdMapAd = await buildDriverDepotIdMap();
+    const navigation_url = buildNavigationUrlForRouteWithMaps(
+      route_id,
+      driver_id,
+      depotsNavAd,
+      driverDepotIdMapAd,
+      useGoogleMaps
+    );
+
     res.json({
       success: true,
       message: 'Driver assigned successfully',
       route: {
         id: route_id,
         driver_id: driver_id,
-        status: 'assigned'
+        status: 'assigned',
+        navigation_url
       },
+      navigation_url,
       driver: {
         id: driver.id,
         name: driver.name,
@@ -2162,16 +2586,39 @@ app.post('/api/orders/auto-assign-drivers', async (req, res) => {
       });
     }
 
+    let routeSettings = { ...inMemorySettings };
+    if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+      try {
+        const { createClient } = require('@supabase/supabase-js');
+        const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+        const { data: dbSettings } = await supabase.from('settings').select('*').single();
+        routeSettings = { ...routeSettings, ...(dbSettings || {}) };
+      } catch (settingsErr) {
+        console.warn('auto-assign settings DB unavailable:', settingsErr.message);
+      }
+    }
+    const useGoogleMaps = routeSettings.navigation_app_preference === 'google';
+    const depotsNavAa = await getDepotsListForNavigation();
+    const driverDepotIdMapAa = await buildDriverDepotIdMap();
+
     // Auto-assign using round-robin
     const assignedRoutes = routes.map((route, index) => {
       const selectedDriver = drivers[index % drivers.length];
       // Persist the assignment
       routeDriverMap.set(route.route_id, selectedDriver.id);
+      const navigation_url = buildNavigationUrlForRouteWithMaps(
+        route.route_id,
+        selectedDriver.id,
+        depotsNavAa,
+        driverDepotIdMapAa,
+        useGoogleMaps
+      );
       return {
         ...route,
         driver_id: selectedDriver.id,
         driver_name: `${selectedDriver.name} (${selectedDriver.mpg || 30} MPG)`,
-        status: 'assigned'
+        status: 'assigned',
+        navigation_url
       };
     });
     persist();
@@ -2263,7 +2710,8 @@ async function getAvailableDriversData() {
         id: driver.id,
         name: `${driver.first_name} ${driver.last_name}`,
         email: driver.email,
-        mpg: driver.mpg || 30
+        mpg: driver.mpg || 30,
+        depot_id: driver.depot_id
       }));
     } catch (error) {
       console.warn('getAvailableDriversData DB unavailable, falling back to local drivers:', error.message);
@@ -2276,7 +2724,8 @@ async function getAvailableDriversData() {
       id: d.id,
       name: d.name || `${d.first_name || ''} ${d.last_name || ''}`.trim(),
       email: d.email,
-      mpg: d.mpg || 30
+      mpg: d.mpg || 30,
+      depot_id: d.depot_id
     }));
 }
 
@@ -2966,6 +3415,9 @@ app.get('/api/orders/driver-routes/:driverId', async (req, res) => {
     
     console.log(`🚛 Getting routes for driver ${driverId} on ${date}`);
 
+    const depotsNavDr = await getDepotsListForNavigation();
+    const driverDepotIdMapDr = await buildDriverDepotIdMap();
+
     if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
       try {
         const { createClient } = require('@supabase/supabase-js');
@@ -3024,7 +3476,17 @@ app.get('/api/orders/driver-routes/:driverId', async (req, res) => {
               total_distance_km: route.total_distance_km,
               estimated_fuel_cost: route.estimated_fuel_cost,
               route_efficiency_score: route.route_efficiency_score,
-              navigation_url: route.navigation_url,
+              navigation_url: (() => {
+                const navDepot = getDepotForNavigation(driverId, depotsNavDr, driverDepotIdMapDr);
+                const wps = (orders || []).map((o) => waypointFromOrderForNav(o, navDepot)).filter(Boolean);
+                if (wps.length === 0) return route.navigation_url;
+                const result = generateNavigationURL(
+                  { latitude: navDepot.latitude, longitude: navDepot.longitude },
+                  wps,
+                  true
+                );
+                return typeof result === 'object' ? result.url : result;
+              })(),
               created_at: route.created_at,
               orders: orders.map((order, index) => ({
                 ...order,
@@ -3092,15 +3554,14 @@ app.get('/api/orders/driver-routes/:driverId', async (req, res) => {
           estimated_fuel_cost: Math.round((8 + orders.length * 1.2) * 100) / 100,
           route_efficiency_score: Math.round((85 + Math.random() * 15) * 10) / 10,
           navigation_url: (() => {
-            const primaryDepot = MOCK_DEPOTS.find(d => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
-            return generateNavigationURL(
-              { latitude: primaryDepot.latitude, longitude: primaryDepot.longitude },
-              orders.map(order => ({
-                lat: parseFloat(order.latitude) || primaryDepot.latitude,
-                lng: parseFloat(order.longitude) || primaryDepot.longitude
-              })),
-              false
+            const navDepot = getDepotForNavigation(driverId, depotsNavDr, driverDepotIdMapDr);
+            const wps = orders.map((o) => waypointFromOrderForNav(o, navDepot)).filter(Boolean);
+            const result = generateNavigationURL(
+              { latitude: navDepot.latitude, longitude: navDepot.longitude },
+              wps,
+              true
             );
+            return typeof result === 'object' ? result.url : result;
           })(),
           created_at: new Date().toISOString(),
           orders: orders.map((order, index) => ({
@@ -3290,7 +3751,9 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`📍 Server running on http://0.0.0.0:${PORT}`);
   console.log(`🔗 Health check: http://0.0.0.0:${PORT}/api/health`);
   console.log(`🆔 PID ${process.pid} — keep this terminal open while the app runs. Press Ctrl+C to stop.`);
-  console.log(`💾 Database: ${process.env.SUPABASE_URL ? 'Supabase Connected' : 'Mock Data Mode'}`);
+  const sb = !!(process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY);
+  console.log(`💾 Data: ${sb ? 'Supabase API (settings/depots/drivers) + local db.json (generated routes & sessions)' : 'Local db.json + memory only — add SUPABASE_URL + SUPABASE_ANON_KEY to match production'}`);
+  console.log(`🌐 CORS: CLIENT_URL=${process.env.CLIENT_URL || '(any localhost / *.vercel.app)'}  |  CORS_ALLOW_VERCEL=${String(process.env.CORS_ALLOW_VERCEL).toLowerCase() === 'false' ? 'false' : 'true'}`);
   console.log('\n📋 Available endpoints:');
   console.log('   GET  /api/health');
   console.log('   GET  /api/admin/settings');
