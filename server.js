@@ -924,12 +924,16 @@ app.put('/api/admin/drivers/:id', async (req, res) => {
       try {
         const { createClient } = require('@supabase/supabase-js');
         const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+        const rawDepot = body.depotId ?? body.depot_id;
+        const depotIdResolved =
+          rawDepot === '' || rawDepot === undefined ? null : rawDepot;
+
         const updateData = {
           first_name: body.firstName ?? body.first_name,
           last_name: body.lastName ?? body.last_name,
           email: body.email,
           phone: body.phone,
-          depot_id: body.depotId ?? body.depot_id,
+          depot_id: depotIdResolved,
           mpg: body.mpg !== undefined ? parseFloat(body.mpg) : undefined,
           vehicle_type: body.vehicleType ?? body.vehicle_type,
           vehicle_capacity: body.vehicleCapacity !== undefined ? parseInt(body.vehicleCapacity) : body.vehicle_capacity,
@@ -1196,11 +1200,12 @@ function pickDepotForZoneOrders(orders, depotsList) {
   }
   const cLat = validOrders.reduce((s, o) => s + parseFloat(o.latitude), 0) / validOrders.length;
   const cLng = validOrders.reduce((s, o) => s + parseFloat(o.longitude), 0) / validOrders.length;
+  usableDepots.sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
   let best = usableDepots[0];
   let bestD = Infinity;
   for (const d of usableDepots) {
     const dist = haversineKm(cLat, cLng, parseFloat(d.latitude), parseFloat(d.longitude));
-    if (dist < bestD) {
+    if (dist < bestD - 1e-9) {
       bestD = dist;
       best = d;
     }
@@ -1447,10 +1452,12 @@ async function getDepotsListForNavigation() {
     try {
       const { createClient } = require('@supabase/supabase-js');
       const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+      // Include name; do not filter is_active here — drivers can still reference a depot row that was
+      // toggled inactive, and omitting it breaks getDepotForNavigation (falls back to zone / "first depot").
       const { data: depots, error } = await supabase
         .from('depots')
-        .select('id, latitude, longitude, is_primary')
-        .eq('is_active', true);
+        .select('id, name, latitude, longitude, is_primary, is_active')
+        .order('name');
       if (!error && Array.isArray(depots) && depots.length > 0) {
         return mergeDepotsForNavigation(MOCK_DEPOTS, depots);
       }
@@ -1466,7 +1473,7 @@ async function buildDriverDepotIdMap() {
   const m = new Map();
   for (const d of MOCK_DRIVERS) {
     const id = String(d.id);
-    if (d.depot_id != null && d.depot_id !== '') m.set(id, d.depot_id);
+    if (d.depot_id != null && d.depot_id !== '') m.set(id, String(d.depot_id));
   }
   if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
     try {
@@ -1476,7 +1483,9 @@ async function buildDriverDepotIdMap() {
       if (!error && rows) {
         for (const r of rows) {
           const id = String(r.id);
-          if (r.depot_id != null && r.depot_id !== '') m.set(id, r.depot_id);
+          if (r.depot_id != null && r.depot_id !== '') {
+            m.set(id, String(r.depot_id));
+          }
         }
       }
     } catch (e) {
@@ -1516,6 +1525,9 @@ function getDepotForNavigation(assignedDriverId, depots, driverDepotIdMap, order
   if (d && isValidNavCoord(parseFloat(d.latitude), parseFloat(d.longitude))) {
     return d;
   }
+  console.warn(
+    `[nav] Driver ${assignedDriverId} depot_id=${depotId} missing from merged depots (${list?.length || 0} rows). Using zone fallback. Check Supabase drivers.depot_id and depots rows.`
+  );
   return zoneDepot();
 }
 
