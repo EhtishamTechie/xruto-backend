@@ -365,7 +365,17 @@ app.get('/api/admin/depots', async (req, res) => {
         return res.json({ success: true, depots: formattedDepots });
       } catch (dbErr) { console.warn('Depots DB unavailable, using mock data:', dbErr.message); }
     }
-    res.json({ success: true, depots: MOCK_DEPOTS });
+    const memoryDepots = (MOCK_DEPOTS || []).map((dep) => {
+      const activeDrivers = (MOCK_DRIVERS || []).filter(
+        (dr) => String(dr.depot_id) === String(dep.id) && dr.is_active !== false
+      );
+      return {
+        ...dep,
+        driver_count: activeDrivers.length,
+        available_drivers: activeDrivers.filter((d) => d.is_available_today !== false).length,
+      };
+    });
+    res.json({ success: true, depots: memoryDepots });
   } catch (error) {
     console.error('Get depots error:', error);
     res.status(500).json({ success: false, message: 'Failed to fetch depots', error: error.message });
@@ -782,7 +792,17 @@ app.get('/api/admin/drivers', async (req, res) => {
         return res.json({ success: true, drivers: formattedDrivers });
       } catch (dbErr) { console.warn('Drivers DB unavailable, using mock data:', dbErr.message); }
     }
-    res.json({ success: true, drivers: MOCK_DRIVERS });
+    const memoryDrivers = (MOCK_DRIVERS || []).map((d) => {
+      const dep = (MOCK_DEPOTS || []).find((x) => String(x.id) === String(d.depot_id));
+      const depotName = dep?.name || 'No depot';
+      const mpg = d.mpg || 30;
+      return {
+        ...d,
+        depot_name: depotName,
+        details: `${depotName}, ${mpg} MPG`,
+      };
+    });
+    res.json({ success: true, drivers: memoryDrivers });
   } catch (error) {
     console.error('Get drivers error:', error);
     res.status(500).json({ success: false, message: 'Failed to fetch drivers', error: error.message });
@@ -1161,6 +1181,33 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
 
+/**
+ * Pick the depot to use for a zone’s route (start/end) before a driver is assigned.
+ * Uses the depot closest to the order centroid — not the “first” depot in the list.
+ */
+function pickDepotForZoneOrders(orders, depotsList) {
+  if (!depotsList || !depotsList.length) return null;
+  const usableDepots = depotsList.filter((d) => depotCoordsUsable(parseFloat(d.latitude), parseFloat(d.longitude)));
+  if (!usableDepots.length) return null;
+  if (usableDepots.length === 1) return usableDepots[0];
+  const validOrders = (orders || []).filter((o) => depotCoordsUsable(parseFloat(o.latitude), parseFloat(o.longitude)));
+  if (!validOrders.length) {
+    return usableDepots.find((d) => d.is_primary) || usableDepots[0];
+  }
+  const cLat = validOrders.reduce((s, o) => s + parseFloat(o.latitude), 0) / validOrders.length;
+  const cLng = validOrders.reduce((s, o) => s + parseFloat(o.longitude), 0) / validOrders.length;
+  let best = usableDepots[0];
+  let bestD = Infinity;
+  for (const d of usableDepots) {
+    const dist = haversineKm(cLat, cLng, parseFloat(d.latitude), parseFloat(d.longitude));
+    if (dist < bestD) {
+      bestD = dist;
+      best = d;
+    }
+  }
+  return best;
+}
+
 // Nearest UK postcode area from lat/lon (covers Bristol & Warrington + common UK areas)
 function getApproxPostcodeArea(lat, lng) {
   const POSTCODE_CENTROIDS = [
@@ -1440,35 +1487,54 @@ async function buildDriverDepotIdMap() {
 }
 
 /**
- * Depot for start/end in /maps URLs — prefer the assigned driver’s depot, not the global primary
- * (e.g. Warrington primary vs UET Taxila for a Pakistan run).
+ * Depot for start/end in /maps URLs:
+ * 1) Assigned driver’s depot (from map + live MOCK_DRIVERS fallback for depot_id)
+ * 2) Else zone: depot closest to this route’s order centroid (not global “primary” / first in list)
+ * 3) Else primary in list
+ *
+ * `orders` should be this route’s stops so unassigned routes and bad/missing depot coords stay local to the zone.
  */
-function getDepotForNavigation(assignedDriverId, depots, driverDepotIdMap) {
+function getDepotForNavigation(assignedDriverId, depots, driverDepotIdMap, orders) {
   const list = depots && depots.length ? depots : MOCK_DEPOTS;
   const primary = pickPrimaryDepotFromList(list);
-  if (!assignedDriverId) return primary;
-  const depotId = driverDepotIdMap
-    ? driverDepotIdMap.get(String(assignedDriverId))
-    : (MOCK_DRIVERS.find((d) => String(d.id) === String(assignedDriverId)) || {}).depot_id;
-  if (depotId == null || depotId === '') return primary;
+  const zoneDepot = () => {
+    const z = pickDepotForZoneOrders(orders || [], list);
+    if (z && isValidNavCoord(parseFloat(z.latitude), parseFloat(z.longitude))) return z;
+    return primary;
+  };
+
+  let depotId = driverDepotIdMap ? driverDepotIdMap.get(String(assignedDriverId)) : undefined;
+  if (depotId == null || depotId === '') {
+    depotId = (MOCK_DRIVERS.find((d) => String(d.id) === String(assignedDriverId)) || {}).depot_id;
+  }
+  if (!assignedDriverId || depotId == null || depotId === '') {
+    return zoneDepot();
+  }
+
   let d = (list || []).find((x) => String(x.id) === String(depotId));
   if (!d) d = MOCK_DEPOTS.find((x) => String(x.id) === String(depotId));
   if (d && isValidNavCoord(parseFloat(d.latitude), parseFloat(d.longitude))) {
     return d;
   }
-  return primary;
+  return zoneDepot();
 }
 
-function buildNavigationUrlForRouteWithMaps(routeId, driverId, depotsNav, driverDepotIdMap, useGoogleMaps) {
+/** Returns nav URL and depot name used for start/end in Maps (driver’s depot when assigned). */
+function buildRouteNavigationWithMaps(routeId, driverId, depotsNav, driverDepotIdMap, useGoogleMaps) {
   const orders = routeOrdersMap.get(routeId) || [];
-  const navDepot = getDepotForNavigation(driverId, depotsNav, driverDepotIdMap);
+  const navDepot = getDepotForNavigation(driverId, depotsNav, driverDepotIdMap, orders);
   const wps = orders.map((o) => waypointFromOrderForNav(o, navDepot)).filter(Boolean);
   const result = generateNavigationURL(
     { latitude: navDepot.latitude, longitude: navDepot.longitude },
     wps,
     useGoogleMaps
   );
-  return typeof result === 'object' ? result.url : result;
+  const navigation_url = typeof result === 'object' ? result.url : result;
+  return { navigation_url, maps_depot_name: navDepot.name || null };
+}
+
+function buildNavigationUrlForRouteWithMaps(routeId, driverId, depotsNav, driverDepotIdMap, useGoogleMaps) {
+  return buildRouteNavigationWithMaps(routeId, driverId, depotsNav, driverDepotIdMap, useGoogleMaps).navigation_url;
 }
 
 /** Build nav waypoint from order + depot; never uses 0,0 as a real coordinate. */
@@ -2112,6 +2178,8 @@ app.post('/api/orders/generate-routes', async (req, res) => {
 
     console.log('Generating optimized routes for', zones.length, 'zones');
 
+    const depotsListForRoutes = await getDepotsListForNavigation();
+
     const routes = zones.map((zone, index) => {
       const routeId = `route_${index + 1}`;
       
@@ -2135,7 +2203,11 @@ app.post('/api/orders/generate-routes', async (req, res) => {
       // The driver returns to the depot to reload between segments.
       // This ensures the vehicle is never overloaded.
       const allOrders = zone.orders || [];
-      const primaryDepot = MOCK_DEPOTS.find(d => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
+      // Depots for this zone: closest to order centroid (not always “first” / primary in the list)
+      const zoneDepot = pickDepotForZoneOrders(allOrders, depotsListForRoutes)
+        || MOCK_DEPOTS.find((d) => d.is_primary)
+        || MOCK_DEPOTS[0]
+        || { latitude: 0, longitude: 0 };
       let route_segments = [];
       if (enableStockRefill && allOrders.length > maxDeliveriesPerTrip) {
         // Split orders into batches; each batch is a sub-trip ending with depot return
@@ -2166,17 +2238,17 @@ app.post('/api/orders/generate-routes', async (req, res) => {
       // Generate navigation URL with detailed stats (never 0,0: unset depot + bad fallback breaks Google Maps)
       const navWaypoints = (zone.orders || [])
         .map((order, index) => {
-          const wp = waypointFromOrderForNav(order, primaryDepot);
+          const wp = waypointFromOrderForNav(order, zoneDepot);
           if (wp) {
             console.log(`🗂️ Order ${index + 1}: ID=${order.id?.substring(0, 8)}, postcode=${order.postcode}, coords=${wp.lat},${wp.lng}`);
           } else {
-            console.warn(`🗂️ Order ${index + 1}: skip nav — no valid order coords and depot has no valid lat/lng (set primary depot on map in Admin).`);
+            console.warn(`🗂️ Order ${index + 1}: skip nav — no valid order coords and depot has no valid lat/lng (set a depot on the map in Admin).`);
           }
           return wp;
         })
         .filter(Boolean);
       const navigationResult = generateNavigationURL(
-        { latitude: primaryDepot.latitude, longitude: primaryDepot.longitude },
+        { latitude: zoneDepot.latitude, longitude: zoneDepot.longitude },
         navWaypoints,
         useGoogleMaps
       );
@@ -2232,6 +2304,9 @@ app.post('/api/orders/generate-routes', async (req, res) => {
         route_segments,
         depot_returns_count: depotReturnsCount,
         stock_refill_enabled: enableStockRefill,
+        /** Used for map URL before a driver is assigned (closest depot to this zone’s stops) */
+        depot_start_name: zoneDepot.name || null,
+        depot_start_id: zoneDepot.id != null ? String(zoneDepot.id) : null,
         source: 'mock_optimization'
       };
     });
@@ -2329,6 +2404,8 @@ app.get('/api/orders/get-routes', async (req, res) => {
           continue;
         }
 
+        const useGoogleMaps = inMemorySettings.navigation_app_preference === 'google';
+        const navDepotForRoute = getDepotForNavigation(assignedDriverId, depotsNav, driverDepotIdMap, orders);
         const routeDetails = {
           id: routeId,
           route_id: routeId,
@@ -2345,13 +2422,13 @@ app.get('/api/orders/get-routes', async (req, res) => {
           zone_color: ['#FF6B35', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7'][parseInt(routeId.split('_')[1], 10) % 5],
           depot_returns_needed: Math.ceil(orderCount / 15),
           route_efficiency_score: Math.round((Math.min(95, 85 + Math.random() * 10) * 10)) / 10,
+          maps_depot_name: navDepotForRoute.name || null,
           navigation_url: (() => {
-            const navDepot = getDepotForNavigation(assignedDriverId, depotsNav, driverDepotIdMap);
-            const wps = orders.map((o) => waypointFromOrderForNav(o, navDepot)).filter(Boolean);
+            const wps = orders.map((o) => waypointFromOrderForNav(o, navDepotForRoute)).filter(Boolean);
             const result = generateNavigationURL(
-              { latitude: navDepot.latitude, longitude: navDepot.longitude },
+              { latitude: navDepotForRoute.latitude, longitude: navDepotForRoute.longitude },
               wps,
-              true
+              useGoogleMaps
             );
             return typeof result === 'object' ? result.url : result;
           })(),
@@ -2531,7 +2608,7 @@ app.post('/api/orders/assign-driver', async (req, res) => {
     const useGoogleMaps = routeSettings.navigation_app_preference === 'google';
     const depotsNavAd = await getDepotsListForNavigation();
     const driverDepotIdMapAd = await buildDriverDepotIdMap();
-    const navigation_url = buildNavigationUrlForRouteWithMaps(
+    const { navigation_url, maps_depot_name } = buildRouteNavigationWithMaps(
       route_id,
       driver_id,
       depotsNavAd,
@@ -2546,9 +2623,11 @@ app.post('/api/orders/assign-driver', async (req, res) => {
         id: route_id,
         driver_id: driver_id,
         status: 'assigned',
-        navigation_url
+        navigation_url,
+        maps_depot_name
       },
       navigation_url,
+      maps_depot_name,
       driver: {
         id: driver.id,
         name: driver.name,
@@ -2606,7 +2685,7 @@ app.post('/api/orders/auto-assign-drivers', async (req, res) => {
       const selectedDriver = drivers[index % drivers.length];
       // Persist the assignment
       routeDriverMap.set(route.route_id, selectedDriver.id);
-      const navigation_url = buildNavigationUrlForRouteWithMaps(
+      const { navigation_url, maps_depot_name } = buildRouteNavigationWithMaps(
         route.route_id,
         selectedDriver.id,
         depotsNavAa,
@@ -2618,7 +2697,8 @@ app.post('/api/orders/auto-assign-drivers', async (req, res) => {
         driver_id: selectedDriver.id,
         driver_name: `${selectedDriver.name} (${selectedDriver.mpg || 30} MPG)`,
         status: 'assigned',
-        navigation_url
+        navigation_url,
+        maps_depot_name
       };
     });
     persist();
@@ -3477,13 +3557,14 @@ app.get('/api/orders/driver-routes/:driverId', async (req, res) => {
               estimated_fuel_cost: route.estimated_fuel_cost,
               route_efficiency_score: route.route_efficiency_score,
               navigation_url: (() => {
-                const navDepot = getDepotForNavigation(driverId, depotsNavDr, driverDepotIdMapDr);
+                const navDepot = getDepotForNavigation(driverId, depotsNavDr, driverDepotIdMapDr, orders || []);
                 const wps = (orders || []).map((o) => waypointFromOrderForNav(o, navDepot)).filter(Boolean);
                 if (wps.length === 0) return route.navigation_url;
+                const useGm = inMemorySettings.navigation_app_preference === 'google';
                 const result = generateNavigationURL(
                   { latitude: navDepot.latitude, longitude: navDepot.longitude },
                   wps,
-                  true
+                  useGm
                 );
                 return typeof result === 'object' ? result.url : result;
               })(),
@@ -3554,12 +3635,13 @@ app.get('/api/orders/driver-routes/:driverId', async (req, res) => {
           estimated_fuel_cost: Math.round((8 + orders.length * 1.2) * 100) / 100,
           route_efficiency_score: Math.round((85 + Math.random() * 15) * 10) / 10,
           navigation_url: (() => {
-            const navDepot = getDepotForNavigation(driverId, depotsNavDr, driverDepotIdMapDr);
+            const navDepot = getDepotForNavigation(driverId, depotsNavDr, driverDepotIdMapDr, orders);
             const wps = orders.map((o) => waypointFromOrderForNav(o, navDepot)).filter(Boolean);
+            const useGm = inMemorySettings.navigation_app_preference === 'google';
             const result = generateNavigationURL(
               { latitude: navDepot.latitude, longitude: navDepot.longitude },
               wps,
-              true
+              useGm
             );
             return typeof result === 'object' ? result.url : result;
           })(),
