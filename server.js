@@ -8,9 +8,45 @@ const axios = require('axios');
 const PDFParserService = require('./services/pdfParser');
 require('dotenv').config();
 
+/** Trim / strip accidental quotes from .env so fetch target is valid. */
+function normalizeSupabaseEnvUrl() {
+  const raw = process.env.SUPABASE_URL;
+  if (!raw || typeof raw !== 'string') return;
+  const t = raw.trim().replace(/^["']|["']$/g, '');
+  if (t !== raw) process.env.SUPABASE_URL = t;
+}
+normalizeSupabaseEnvUrl();
+
+/**
+ * Node's fetch wraps network failures as TypeError("fetch failed"); details are on error.cause.
+ */
+function describeFetchFailure(err) {
+  if (!err) return 'unknown error';
+  const base = err.message || String(err);
+  const c = err.cause;
+  if (c && typeof c === 'object') {
+    const code = c.code ? `${c.code}: ` : '';
+    const cm = c.message || String(c);
+    if (cm && cm !== base) return `${base} — ${code}${cm}`;
+  }
+  return base;
+}
+
+/** Supabase sometimes returns PostgREST-style errors with message text instead of rejecting (e.g. fetch failed). */
+function isLikelySupabaseTransportError(error) {
+  if (!error) return false;
+  const msg = String(error.message || error).toLowerCase();
+  if (/fetch failed|fetch error|network request failed|failed to fetch|econnrefused|etimedout|enotfound|getaddrinfo/.test(msg)) {
+    return true;
+  }
+  return !!(error.cause && typeof error.cause === 'object');
+}
+
 // Fallback env vars for Railway deployment (values come from Railway env config)
 if (!process.env.SUPABASE_URL) {
   console.warn('⚠️ SUPABASE_URL not set — set it in .env or Railway environment variables');
+} else if (!/^https:\/\//i.test(String(process.env.SUPABASE_URL).trim())) {
+  console.warn('⚠️ SUPABASE_URL must start with https:// — outbound fetch will likely fail.');
 }
 if (!process.env.HERE_API_KEY) {
   console.warn('⚠️ HERE_API_KEY not set — HERE Matrix API features will be disabled');
@@ -311,7 +347,7 @@ app.get('/api/admin/settings', async (req, res) => {
         if (error && error.code !== 'PGRST116') throw error;
         inMemorySettings = { ...inMemorySettings, ...(settings || {}) };
         return res.json({ success: true, settings: inMemorySettings });
-      } catch (dbErr) { console.warn('Settings DB unavailable, using local data:', dbErr.message); }
+      } catch (dbErr) { console.warn('Settings DB unavailable, using local data:', describeFetchFailure(dbErr)); }
     }
     res.json({ success: true, settings: inMemorySettings });
   } catch (error) {
@@ -337,7 +373,7 @@ app.put('/api/admin/settings', async (req, res) => {
         inMemorySettings = { ...inMemorySettings, ...(result.data || {}), ...(req.body || {}) };
         persist();
         return res.json({ success: true, message: 'Settings updated successfully', settings: inMemorySettings });
-      } catch (dbErr) { console.warn('Settings PUT DB unavailable:', dbErr.message); }
+      } catch (dbErr) { console.warn('Settings PUT DB unavailable:', describeFetchFailure(dbErr)); }
     }
     inMemorySettings = { ...inMemorySettings, ...(req.body || {}) };
     persist();
@@ -363,7 +399,7 @@ app.get('/api/admin/depots', async (req, res) => {
           return { id: depot.id, name: depot.name, address: depot.address, city: depot.city || '', postcode: depot.postcode || '', latitude: depot.latitude, longitude: depot.longitude, capacity: depot.capacity || 500, is_primary: depot.is_primary || false, is_active: depot.is_active, driver_count: active.length, available_drivers: active.filter(d => d.is_available_today).length, contact_phone: depot.contact_phone || '', contact_email: depot.contact_email || '' };
         });
         return res.json({ success: true, depots: formattedDepots });
-      } catch (dbErr) { console.warn('Depots DB unavailable, using mock data:', dbErr.message); }
+      } catch (dbErr) { console.warn('Depots DB unavailable, using mock data:', describeFetchFailure(dbErr)); }
     }
     const memoryDepots = (MOCK_DEPOTS || []).map((dep) => {
       const activeDrivers = (MOCK_DRIVERS || []).filter(
@@ -593,7 +629,7 @@ app.post('/api/admin/depots', async (req, res) => {
           }
         });
       } catch (dbErr) {
-        console.warn('Add depot DB unavailable, using memory fallback:', dbErr.message);
+        console.warn('Add depot DB unavailable, using memory fallback:', describeFetchFailure(dbErr));
       }
     }
 
@@ -695,7 +731,7 @@ app.put('/api/admin/depots/:id', async (req, res) => {
           depot: data
         });
       } catch (dbErr) {
-        console.warn('Depot update DB unavailable, using memory fallback:', dbErr.message);
+        console.warn('Depot update DB unavailable, using memory fallback:', describeFetchFailure(dbErr));
       }
     }
 
@@ -761,7 +797,7 @@ app.delete('/api/admin/depots/:id', async (req, res) => {
         if (error) throw error;
         return res.json({ success: true, message: 'Depot removed successfully' });
       } catch (dbErr) {
-        console.warn('Depot delete DB unavailable, using memory fallback:', dbErr.message);
+        console.warn('Depot delete DB unavailable, using memory fallback:', describeFetchFailure(dbErr));
       }
     }
 
@@ -790,7 +826,7 @@ app.get('/api/admin/drivers', async (req, res) => {
         if (error) throw error;
         const formattedDrivers = (drivers || []).map(d => ({ id: d.id, name: `${d.first_name||''} ${d.last_name||''}`.trim(), email: d.email, phone: d.phone, first_name: d.first_name, last_name: d.last_name, depot_id: d.depot_id, mpg: d.mpg, vehicle_type: d.vehicle_type, vehicle_capacity: d.vehicle_capacity, license_plate: d.license_plate, is_active: d.is_active, is_available_today: d.is_available_today, details: `${d.depots?.name||'No Depot'}, ${d.mpg||30} MPG` }));
         return res.json({ success: true, drivers: formattedDrivers });
-      } catch (dbErr) { console.warn('Drivers DB unavailable, using mock data:', dbErr.message); }
+      } catch (dbErr) { console.warn('Drivers DB unavailable, using mock data:', describeFetchFailure(dbErr)); }
     }
     const memoryDrivers = (MOCK_DRIVERS || []).map((d) => {
       const dep = (MOCK_DEPOTS || []).find((x) => String(x.id) === String(d.depot_id));
@@ -882,7 +918,7 @@ app.post('/api/admin/drivers', async (req, res) => {
           driver: formattedDriver
         });
       } catch (dbErr) {
-        console.warn('Add driver DB unavailable, using memory fallback:', dbErr.message);
+        console.warn('Add driver DB unavailable, using memory fallback:', describeFetchFailure(dbErr));
       }
     }
 
@@ -950,7 +986,7 @@ app.put('/api/admin/drivers/:id', async (req, res) => {
         if (error) throw error;
         return res.json({ success: true, message: 'Driver updated successfully', driver: data });
       } catch (dbErr) {
-        console.warn('Driver update DB unavailable, using memory fallback:', dbErr.message);
+        console.warn('Driver update DB unavailable, using memory fallback:', describeFetchFailure(dbErr));
       }
     }
 
@@ -990,7 +1026,7 @@ app.delete('/api/admin/drivers/:id', async (req, res) => {
         if (error) throw error;
         return res.json({ success: true, message: 'Driver removed successfully' });
       } catch (dbErr) {
-        console.warn('Driver delete DB unavailable, using memory fallback:', dbErr.message);
+        console.warn('Driver delete DB unavailable, using memory fallback:', describeFetchFailure(dbErr));
       }
     }
 
@@ -1029,7 +1065,7 @@ app.patch('/api/admin/drivers/:id/status', async (req, res) => {
         if (error) throw error;
         return res.json({ success: true, message: 'Driver status updated successfully', driver: data });
       } catch (dbErr) {
-        console.warn('Driver status DB unavailable, using memory fallback:', dbErr.message);
+        console.warn('Driver status DB unavailable, using memory fallback:', describeFetchFailure(dbErr));
       }
     }
 
@@ -1876,7 +1912,7 @@ app.post('/api/orders/upload-text', async (req, res) => {
           insertedCount: insertedOrders.length
         });
       } catch (dbErr) {
-        console.warn('Supabase unavailable for upload-text, falling back to memory:', dbErr.message);
+        console.warn('Supabase unavailable for upload-text, falling back to memory:', describeFetchFailure(dbErr));
       }
     }
 
@@ -1992,7 +2028,7 @@ app.post('/api/orders/upload-excel', excelUpload.single('excelFile'), async (req
         if (error) throw error;
         return res.json({ success: true, message: `Inserted ${insertedOrders.length} orders from Excel`, orders: insertedOrders, insertedCount: insertedOrders.length });
       } catch (dbErr) {
-        console.warn('Supabase unavailable, storing Excel orders in memory:', dbErr.message);
+        console.warn('Supabase unavailable, storing Excel orders in memory:', describeFetchFailure(dbErr));
       }
     }
 
@@ -2045,7 +2081,7 @@ app.delete('/api/orders/reset', async (req, res) => {
           deletedCount: orderCount
         });
       } catch (dbErr) {
-        console.warn('Supabase unavailable for reset, clearing in-memory orders:', dbErr.message);
+        console.warn('Supabase unavailable for reset, clearing in-memory orders:', describeFetchFailure(dbErr));
       }
     }
 
@@ -2129,7 +2165,7 @@ app.post('/api/orders/generate-clusters', async (req, res) => {
           message: `Successfully clustered ${filteredOrders.length} orders into ${zones.length} zones`
         });
       } catch (dbErr) {
-        console.warn('Supabase unavailable for clustering, using in-memory orders:', dbErr.message);
+        console.warn('Supabase unavailable for clustering, using in-memory orders:', describeFetchFailure(dbErr));
       }
     }
 
@@ -2171,7 +2207,7 @@ app.post('/api/orders/generate-routes', async (req, res) => {
         const { data: dbSettings } = await supabase.from('settings').select('*').single();
         routeSettings = { ...routeSettings, ...(dbSettings || {}) };
       } catch (settingsErr) {
-        console.warn('Route generation settings DB unavailable, using memory settings:', settingsErr.message);
+        console.warn('Route generation settings DB unavailable, using memory settings:', describeFetchFailure(settingsErr));
       }
     }
 
@@ -2541,7 +2577,7 @@ app.get('/api/orders/analytics-snapshot', async (req, res) => {
         if (error) throw error;
         eligibleCount = count ?? 0;
       } catch (err) {
-        console.warn('[analytics-snapshot] eligible count fallback local:', err.message);
+        console.warn('[analytics-snapshot] eligible count fallback local:', describeFetchFailure(err));
         eligibleCount = Array.isArray(inMemoryOrders) ? inMemoryOrders.length : 0;
       }
     } else {
@@ -2614,7 +2650,7 @@ app.post('/api/orders/assign-driver', async (req, res) => {
         const { data: dbSettings } = await supabase.from('settings').select('*').single();
         routeSettings = { ...routeSettings, ...(dbSettings || {}) };
       } catch (settingsErr) {
-        console.warn('assign-driver settings DB unavailable:', settingsErr.message);
+        console.warn('assign-driver settings DB unavailable:', describeFetchFailure(settingsErr));
       }
     }
     const useGoogleMaps = routeSettings.navigation_app_preference === 'google';
@@ -2685,7 +2721,7 @@ app.post('/api/orders/auto-assign-drivers', async (req, res) => {
         const { data: dbSettings } = await supabase.from('settings').select('*').single();
         routeSettings = { ...routeSettings, ...(dbSettings || {}) };
       } catch (settingsErr) {
-        console.warn('auto-assign settings DB unavailable:', settingsErr.message);
+        console.warn('auto-assign settings DB unavailable:', describeFetchFailure(settingsErr));
       }
     }
     const useGoogleMaps = routeSettings.navigation_app_preference === 'google';
@@ -2806,7 +2842,7 @@ async function getAvailableDriversData() {
         depot_id: driver.depot_id
       }));
     } catch (error) {
-      console.warn('getAvailableDriversData DB unavailable, falling back to local drivers:', error.message);
+      console.warn('getAvailableDriversData DB unavailable, falling back to local drivers:', describeFetchFailure(error));
     }
   }
   // Fallback: return MOCK_DRIVERS that are active
@@ -2839,7 +2875,7 @@ app.get('/api/orders/eligible', async (req, res) => {
           if (error) throw error;
           return res.json({ success: true, total_orders: count ?? 0, date, source: 'supabase' });
         } catch (dbErr) {
-          console.warn('Supabase count unavailable, using local count:', dbErr.message);
+          console.warn('Supabase count unavailable, using local count:', describeFetchFailure(dbErr));
         }
       }
       return res.json({
@@ -2865,7 +2901,7 @@ app.get('/api/orders/eligible', async (req, res) => {
         const postcodeOptions = [...new Set(processedOrders.map(o => o.postcode_area))].sort();
         return res.json({ success: true, orders: processedOrders, postcode_options: postcodeOptions, total_orders: processedOrders.length, date });
       } catch (dbErr) {
-        console.warn('Supabase unavailable, using local data:', dbErr.message);
+        console.warn('Supabase unavailable, using local data:', describeFetchFailure(dbErr));
       }
     }
     // Use in-memory orders from db.json (no mock fallback)
@@ -2917,7 +2953,7 @@ app.get('/api/orders/available-drivers', async (req, res) => {
         if (error) throw error;
         supabaseDrivers = drivers;
       } catch (dbErr) {
-        console.warn('Supabase unavailable for available-drivers, falling back to mock:', dbErr.message);
+        console.warn('Supabase unavailable for available-drivers, falling back to mock:', describeFetchFailure(dbErr));
       }
     }
 
@@ -3603,7 +3639,7 @@ app.get('/api/orders/driver-routes/:driverId', async (req, res) => {
           }
         }
       } catch (dbError) {
-        console.error('Database connection error:', dbError.message);
+        console.error('Database connection error:', describeFetchFailure(dbError));
         // Fall through to memory/mock data
       }
     }
@@ -3776,7 +3812,7 @@ app.post('/api/orders/driver-update-status', async (req, res) => {
           timestamp: new Date().toISOString()
         });
       } catch (dbError) {
-        console.error('Database error, falling back to memory:', dbError.message);
+        console.error('Database error, falling back to memory:', describeFetchFailure(dbError));
         // Fall through to memory update
       }
     }
@@ -3873,6 +3909,33 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log('   POST /api/auth/login');
   console.log('\n✨ Your React frontend should now connect successfully!');
   console.log('📊 Route-order tracking: Dynamic order management active\n');
+
+  setImmediate(() => {
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) return;
+    try {
+      const { createClient } = require('@supabase/supabase-js');
+      const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+      supabase
+        .from('settings')
+        .select('id')
+        .limit(1)
+        .then(({ error }) => {
+          if (!error || error.code === 'PGRST116') return;
+          if (isLikelySupabaseTransportError(error)) {
+            console.warn('\n⚠️  Cannot reach Supabase from this machine:', describeFetchFailure(error));
+            console.warn('    Check SUPABASE_URL (https://…supabase.co), DNS/VPN/firewall, proxy/SSL inspection, and that the project is not paused.\n');
+            return;
+          }
+          console.warn('\n⚠️  Supabase responded but settings query failed:', error.message || error);
+        })
+        .catch((err) => {
+          console.warn('\n⚠️  Cannot reach Supabase from this machine:', describeFetchFailure(err));
+          console.warn('    Check SUPABASE_URL (https://…supabase.co), DNS/VPN/firewall, proxy/SSL inspection, and that the project is not paused.\n');
+        });
+    } catch (e) {
+      console.warn('\n⚠️  Supabase client init failed:', describeFetchFailure(e));
+    }
+  });
 });
 
 server.on('error', (err) => {
