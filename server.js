@@ -1234,8 +1234,9 @@ function tieSeedFromRouteId(routeId) {
 }
 
 /**
- * Pick the depot to use for a zone’s route (start/end) before a driver is assigned.
- * Closest depot to order centroid; when distances tie (duplicate depot coords), rotate by tieSeed so zones differ.
+ * Pick the depot for a zone’s stops (preview / nav before driver assignment).
+ * Uses centroid→depot distance; among depots within a slack band of the nearest (near ties / urban overlap),
+ * rotates by tieSeed so routes don’t all collapse onto one depot name in production.
  */
 function pickDepotForZoneOrders(orders, depotsList, tieSeed = 0) {
   if (!depotsList || !depotsList.length) return null;
@@ -1259,13 +1260,18 @@ function pickDepotForZoneOrders(orders, depotsList, tieSeed = 0) {
     return { d, dist, key: String(d.id ?? d.name ?? '') };
   });
   scored.sort((a, b) => (a.dist !== b.dist ? a.dist - b.dist : a.key.localeCompare(b.key)));
-  const bestD = scored[0].dist;
-  const EPS_KM = 1e-7;
-  const tied = scored.filter((x) => Math.abs(x.dist - bestD) <= EPS_KM);
-  if (tied.length <= 1) return tied[0].d;
 
-  tied.sort((a, b) => a.key.localeCompare(b.key));
-  return tied[seed % tied.length].d;
+  const minD = scored[0].dist;
+  const slackKm = Math.max(minD * 0.22, 2);
+  const cutoff = minD + slackKm;
+  let pool = scored.filter((x) => x.dist <= cutoff);
+
+  if (pool.length < 2) {
+    return scored[0].d;
+  }
+
+  pool = [...pool].sort((a, b) => a.key.localeCompare(b.key));
+  return pool[seed % pool.length].d;
 }
 
 // Nearest UK postcode area from lat/lon (covers Bristol & Warrington + common UK areas)
@@ -1311,9 +1317,11 @@ function getApproxPostcodeArea(lat, lng) {
  * @returns {Object} Zone descriptor with zone_id, zone_name, orders, center, distances, durations
  */
 const ZONE_COLORS = ['#FF6B35', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#90EE90', '#FFB6C1'];
-function buildZone(i, orders) {
-  const _pd = MOCK_DEPOTS.find(d => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
-  const DEPOT_LAT = _pd.latitude, DEPOT_LNG = _pd.longitude;
+function buildZone(i, orders, depotOverride) {
+  // depotOverride is passed from performKMeansClustering when a real depot is available (e.g. fetched from
+  // Supabase in generate-clusters). Fallback to MOCK_DEPOTS only in the local-dev / offline path.
+  const _pd = depotOverride || MOCK_DEPOTS.find(d => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
+  const DEPOT_LAT = parseFloat(_pd.latitude) || 0, DEPOT_LNG = parseFloat(_pd.longitude) || 0;
   const DEPOT_CAPACITY = 25;
 
   const totalMeals = orders.reduce((s, o) => s + (parseInt(o.meal_qty) || parseFloat(o.weight) || 1), 0);
@@ -1370,7 +1378,7 @@ function buildZone(i, orders) {
  * @param {number} numClusters - Requested number of clusters (adjusted by capacity)
  * @returns {Array} Array of zone objects
  */
-function performKMeansClustering(orders, numClusters = 3) {
+function performKMeansClustering(orders, numClusters = 3, depotOverride) {
   if (orders.length === 0) return [];
 
   const valid = orders.filter(o =>
@@ -1435,7 +1443,7 @@ function performKMeansClustering(orders, numClusters = 3) {
   }
 
   // Build zones, skip empty clusters
-  return clusters.filter(cl => cl.length > 0).map((cl, i) => buildZone(i, cl));
+  return clusters.filter(cl => cl.length > 0).map((cl, i) => buildZone(i, cl, depotOverride));
 }
 // Add these helper functions after performKMeansClustering function (around line 200)
 
@@ -2173,8 +2181,13 @@ app.post('/api/orders/generate-clusters', async (req, res) => {
 
         // Use the optimized HereAPIService for clustering (with HERE Matrix API when key is available)
         const hereService = require('./services/hereAPI');
-        const primaryDepot = MOCK_DEPOTS.find(d => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
-        const zones = await hereService.generateOptimizedClustersForArea(filteredOrders, max_zones, performKMeansClustering, primaryDepot);
+        // Fetch the real depot from Supabase (MOCK_DEPOTS is ephemeral on Render and is always empty
+        // after a server restart — using it would pass Null Island 0,0 to the HERE TSP optimiser).
+        const depotsForClustering = await getDepotsListForNavigation();
+        const primaryDepot = depotsForClustering.find(d => d.is_primary) || depotsForClustering[0] || { latitude: 0, longitude: 0 };
+        // Wrap performKMeansClustering in a closure so buildZone receives the correct depot.
+        const clustererWithDepot = (ords, k) => performKMeansClustering(ords, k, primaryDepot);
+        const zones = await hereService.generateOptimizedClustersForArea(filteredOrders, max_zones, clustererWithDepot, primaryDepot);
 
         return res.json({
           success: true,
@@ -2196,7 +2209,10 @@ app.post('/api/orders/generate-clusters', async (req, res) => {
     if (pool.length === 0) {
       return res.json({ success: true, zones: [], total_orders: 0, message: 'No orders found for selected postcodes' });
     }
-    const zones = performKMeansClustering(pool, max_zones);
+    // Use best available depot so buildZone distance estimates are correct even in the in-memory path.
+    const depotsForFallback = await getDepotsListForNavigation();
+    const fallbackDepot = depotsForFallback.find(d => d.is_primary) || depotsForFallback[0] || MOCK_DEPOTS[0] || null;
+    const zones = performKMeansClustering(pool, max_zones, fallbackDepot);
     res.json({
       success: true,
       zones,
@@ -2247,6 +2263,14 @@ app.post('/api/orders/generate-routes', async (req, res) => {
     console.log('Generating optimized routes for', zones.length, 'zones');
 
     const depotsListForRoutes = await getDepotsListForNavigation();
+    const usableDepotNavCount = depotsListForRoutes.filter((d) =>
+      depotCoordsUsable(parseFloat(d.latitude), parseFloat(d.longitude))
+    ).length;
+    if (usableDepotNavCount <= 1) {
+      console.warn(
+        `[generate-routes] Only ${usableDepotNavCount} depot(s) with valid coordinates after merge — every route will use the same base until you add multiple depots (Admin) with distinct lat/lng in Supabase.`
+      );
+    }
 
     const routes = zones.map((zone, index) => {
       const routeId = `route_${index + 1}`;
@@ -2504,12 +2528,14 @@ app.get('/api/orders/get-routes', async (req, res) => {
         }
 
         const useGoogleMaps = inMemorySettings.navigation_app_preference === 'google';
+        const tieNav = tieSeedFromRouteId(routeId);
+        const zoneDepotPick = pickDepotForZoneOrders(orders, depotsNav, tieNav);
         const navDepotForRoute = getDepotForNavigation(
           assignedDriverId,
           depotsNav,
           driverDepotIdMap,
           orders,
-          tieSeedFromRouteId(routeId)
+          tieNav
         );
         const routeDetails = {
           id: routeId,
@@ -2527,6 +2553,8 @@ app.get('/api/orders/get-routes', async (req, res) => {
           zone_color: ['#FF6B35', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7'][parseInt(routeId.split('_')[1], 10) % 5],
           depot_returns_needed: Math.ceil(orderCount / 15),
           route_efficiency_score: Math.round((Math.min(95, 85 + Math.random() * 10) * 10)) / 10,
+          /** Zone-centroid depot (not the driver’s depot when assigned) — keeps “Map:” labels correct after get-routes refresh. */
+          depot_start_name: zoneDepotPick?.name ?? null,
           maps_depot_name: navDepotForRoute.name || null,
           navigation_url: (() => {
             const wps = orders.map((o) => waypointFromOrderForNav(o, navDepotForRoute)).filter(Boolean);

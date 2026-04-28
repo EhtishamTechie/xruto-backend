@@ -127,10 +127,45 @@ class HereAPIService {
   async optimiseStopOrder(orders, depot) {
     if (orders.length <= 2) return orders;
 
-    // Build points array: index 0 = depot, rest = orders
+    // Guard: skip TSP if depot has no valid coordinates (0,0 / NaN / out-of-range).
+    // This happens in production when no depot has been added yet, or when the depot
+    // fetch fails. In that case the K-means order is already reasonable — don't corrupt
+    // it by running TSP from Null Island (0,0).
+    const depotLat = parseFloat(depot?.latitude);
+    const depotLng = parseFloat(depot?.longitude);
+    const depotValid =
+      Number.isFinite(depotLat) && Number.isFinite(depotLng) &&
+      !(Math.abs(depotLat) < 1e-6 && Math.abs(depotLng) < 1e-6) &&
+      Math.abs(depotLat) <= 90 && Math.abs(depotLng) <= 180;
+    if (!depotValid) {
+      return orders; // keep K-means order
+    }
+
+    // Separate orders into those with valid coordinates (can be TSP-optimised) and
+    // those without (null / NaN). The latter are appended at the end so none are
+    // silently dropped — previously NaN distances caused them to be skipped by the
+    // TSP loop and never added to `sequence`.
+    const validOrders = [];
+    const invalidOrders = [];
+    for (const o of orders) {
+      const la = parseFloat(o.latitude);
+      const ln = parseFloat(o.longitude);
+      if (Number.isFinite(la) && Number.isFinite(ln) &&
+          Math.abs(la) <= 90 && Math.abs(ln) <= 180) {
+        validOrders.push(o);
+      } else {
+        invalidOrders.push(o);
+      }
+    }
+
+    if (validOrders.length <= 2) {
+      return [...validOrders, ...invalidOrders];
+    }
+
+    // Build points array: index 0 = depot, then valid orders only
     const points = [
-      { lat: depot.latitude, lng: depot.longitude },
-      ...orders.map(o => ({ lat: parseFloat(o.latitude), lng: parseFloat(o.longitude) }))
+      { lat: depotLat, lng: depotLng },
+      ...validOrders.map(o => ({ lat: parseFloat(o.latitude), lng: parseFloat(o.longitude) }))
     ];
 
     const matrix = await this.getTimeMatrix(points);
@@ -139,7 +174,7 @@ class HereAPIService {
     const visited = new Set([0]);
     const sequence = [];
     let current = 0;
-    while (sequence.length < orders.length) {
+    while (sequence.length < validOrders.length) {
       let bestIdx = -1, bestTime = Infinity;
       for (let j = 1; j < points.length; j++) {
         if (!visited.has(j) && matrix[current][j] < bestTime) {
@@ -149,11 +184,13 @@ class HereAPIService {
       }
       if (bestIdx === -1) break;
       visited.add(bestIdx);
-      sequence.push(bestIdx - 1); // map back to orders index
+      sequence.push(bestIdx - 1); // map back to validOrders index
       current = bestIdx;
     }
 
-    return sequence.map(i => orders[i]);
+    // Return TSP-ordered valid stops, then append any coordinate-less orders at the end
+    const ordered = sequence.map(i => validOrders[i]);
+    return [...ordered, ...invalidOrders];
   }
 
   /* ──────────────── Clustering helper ──────────────── */
@@ -170,10 +207,13 @@ class HereAPIService {
    * @returns {Promise<object[]>}  zones (same shape as buildZone output)
    */
   async generateOptimizedClustersForArea(orders, maxZones, kMeansCluster, depot) {
-    // Step 1: cluster with existing K-means++
+    // Step 1: cluster with K-means++ (kMeansCluster already has the correct depot baked in)
     const zones = kMeansCluster(orders, maxZones);
 
-    // Step 2: optimise stop order within each zone
+    // Step 2: nearest-neighbour TSP to optimise stop order within each zone.
+    // Requires a valid depot as the starting point; optimiseStopOrder will return the
+    // K-means order unchanged when the depot is invalid (0,0 / missing).
+    // HERE API key is not required — _haversineMatrix is used as fallback automatically.
     if (depot) {
       for (const zone of zones) {
         zone.orders = await this.optimiseStopOrder(zone.orders, depot);
