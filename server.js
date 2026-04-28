@@ -433,6 +433,8 @@ function parseLatLngFromGoogleMapsText(input) {
   if (input == null || typeof input !== 'string') return null;
   const s = input.trim();
   if (!s) return null;
+  // Short links (maps.app.goo.gl) have no coordinates embedded — cannot be parsed
+  if (/maps\.app\.goo\.gl/.test(s) || /goo\.gl\/maps/.test(s)) return null;
   const tight = s.replace(/\s/g, '');
   let m = tight.match(/^(-?\d+\.?\d*),(-?\d+\.?\d*)$/);
   if (m) {
@@ -440,14 +442,16 @@ function parseLatLngFromGoogleMapsText(input) {
     const lng = parseFloat(m[2]);
     if (depotCoordsUsable(lat, lng)) return { latitude: lat, longitude: lng };
   }
-  m = s.match(/@(-?\d+\.?\d*),(-?\d+\.?\d*)(?:,|\s|\/|\?|#|z|\]|$)/);
-  if (!m) m = s.match(/@(-?\d+\.?\d*),(-?\d+\.?\d+)/);
+  // !3d…!4d… — actual place pin (try BEFORE @lat,lng which is only the map view center)
+  m = s.match(/!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)/i);
   if (m) {
     const lat = parseFloat(m[1]);
     const lng = parseFloat(m[2]);
     if (depotCoordsUsable(lat, lng)) return { latitude: lat, longitude: lng };
   }
-  m = s.match(/!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)/i);
+  // @lat,lng — map view center (fallback when no place pin)
+  m = s.match(/@(-?\d+\.?\d*),(-?\d+\.?\d*)(?:,|\s|\/|\?|#|z|\]|$)/);
+  if (!m) m = s.match(/@(-?\d+\.?\d*),(-?\d+\.?\d+)/);
   if (m) {
     const lat = parseFloat(m[1]);
     const lng = parseFloat(m[2]);
@@ -569,10 +573,18 @@ app.post('/api/admin/depots', async (req, res) => {
     }
     const latTry = latitude != null && String(latitude).trim() !== '' ? parseFloat(latitude) : NaN;
     const lngTry = longitude != null && String(longitude).trim() !== '' ? parseFloat(longitude) : NaN;
+    // Detect short maps.app.goo.gl links early — they have no coordinates
+    const isShortUrl = googleMapsUrl && (/maps\.app\.goo\.gl/.test(googleMapsUrl) || /goo\.gl\/maps/.test(googleMapsUrl));
+    if (isShortUrl && !depotCoordsUsable(latTry, lngTry) && !addr) {
+      return res.status(400).json({
+        success: false,
+        message: 'Short Google Maps links (maps.app.goo.gl) do not contain coordinates. Open the link in your browser, then copy the full URL from the address bar and paste it here.',
+      });
+    }
     if (!addr && !depotCoordsUsable(latTry, lngTry) && !parseLatLngFromGoogleMapsText(googleMapsUrl)) {
       return res.status(400).json({
         success: false,
-        message: 'Add a street address, or paste a Google Maps link, or enter latitude and longitude.',
+        message: 'Add a street address, or paste the full Google Maps URL from your browser address bar (not a short link), or enter latitude and longitude.',
       });
     }
 
