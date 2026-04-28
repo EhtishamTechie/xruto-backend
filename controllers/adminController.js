@@ -663,6 +663,39 @@ if (!supabaseUrl || !supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+/**
+ * Extract latitude & longitude from a Google Maps URL or plain "lat,lng" string.
+ * Mirrors the frontend parseLatLngFromGoogleMapsText utility.
+ */
+function parseLatLngFromUrl(input) {
+  if (!input || typeof input !== 'string') return null;
+  const s = input.trim();
+  if (!s) return null;
+  const validate = (a, b) => {
+    const lat = parseFloat(a), lng = parseFloat(b);
+    if (!isFinite(lat) || !isFinite(lng)) return null;
+    if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return null;
+    if (Math.abs(lat) < 1e-9 && Math.abs(lng) < 1e-9) return null;
+    return { latitude: lat, longitude: lng };
+  };
+  // Plain "lat,lng"
+  let m = s.replace(/\s/g, '').match(/^(-?\d+\.?\d*),(-?\d+\.?\d*)$/);
+  if (m) { const r = validate(m[1], m[2]); if (r) return r; }
+  // /@lat,lng
+  m = s.match(/@(-?\d+\.?\d*),(-?\d+\.?\d+)/);
+  if (m) { const r = validate(m[1], m[2]); if (r) return r; }
+  // !3d…!4d…
+  m = s.match(/!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)/i);
+  if (m) { const r = validate(m[1], m[2]); if (r) return r; }
+  // ?q=lat,lng or &q=lat,lng
+  m = s.match(/[?&]q=(-?\d+\.?\d*),(-?\d+\.?\d*)\b/);
+  if (m) { const r = validate(m[1], m[2]); if (r) return r; }
+  // ?ll=lat,lng
+  m = s.match(/[?&]ll=(-?\d+\.?\d*),(-?\d+\.?\d*)\b/);
+  if (m) { const r = validate(m[1], m[2]); if (r) return r; }
+  return null;
+}
+
 const adminController = {
   // Get admin settings
   async getSettings(req, res) {
@@ -820,32 +853,50 @@ const adminController = {
     try {
       console.log('Adding depot with data:', req.body);
       
-      const { name, address, city, postcode, capacity, contactPhone, contactEmail, latitude, longitude } = req.body;
+      const { name, address, city, postcode, capacity, contactPhone, contactEmail, latitude, longitude, googleMapsUrl } = req.body;
 
       // Validate required fields
-      if (!name || !address) {
+      if (!name) {
         return res.status(400).json({
           success: false,
-          message: 'Name and address are required'
+          message: 'Depot name is required'
         });
       }
 
-      // If coordinates not provided, try to geocode
-      let finalLat = latitude;
-      let finalLng = longitude;
+      // Resolve coordinates: explicit lat/lng → parsed from googleMapsUrl → geocode via HERE
+      let finalLat = latitude && String(latitude).trim() !== '' ? parseFloat(latitude) : null;
+      let finalLng = longitude && String(longitude).trim() !== '' ? parseFloat(longitude) : null;
 
+      // Safety net: extract from Google Maps URL if lat/lng not directly provided
+      if ((!finalLat || !finalLng) && googleMapsUrl) {
+        const coords = parseLatLngFromUrl(googleMapsUrl);
+        if (coords) {
+          finalLat = coords.latitude;
+          finalLng = coords.longitude;
+          console.log(`[addDepot] Extracted coords from Google Maps URL: ${finalLat}, ${finalLng}`);
+        }
+      }
+
+      // Last resort: try geocoding via HERE API (only works if HERE_API_KEY is set)
       if (!finalLat || !finalLng) {
         try {
           const hereAPI = require('../services/hereAPI');
-          const coords = await hereAPI.geocodeAddress(address, postcode);
-          finalLat = coords.lat;
-          finalLng = coords.lng;
+          const coords = await hereAPI.geocode(address || '', postcode || '');
+          if (coords && coords.lat && coords.lng) {
+            finalLat = coords.lat;
+            finalLng = coords.lng;
+            console.log(`[addDepot] Geocoded coords: ${finalLat}, ${finalLng}`);
+          }
         } catch (geocodeError) {
-          console.warn('Geocoding failed, using default coordinates:', geocodeError.message);
-          // Use Brighton coordinates as fallback
-          finalLat = 53.3808;
-          finalLng = -2.5740;
+          console.warn('[addDepot] Geocoding failed:', geocodeError.message);
         }
+      }
+
+      // If still no valid coordinates, store as null (not a fake fallback)
+      if (!finalLat || !finalLng || !isFinite(finalLat) || !isFinite(finalLng)) {
+        finalLat = null;
+        finalLng = null;
+        console.warn(`[addDepot] No valid coordinates for depot "${name}" — routes will not use this depot until coords are set via edit.`);
       }
 
       // Prepare depot data
@@ -916,10 +967,21 @@ const adminController = {
         delete updateData.contactEmail;
       }
 
+      // Safety net: extract coords from googleMapsUrl if lat/lng not explicitly provided
+      if (updateData.googleMapsUrl && (!updateData.latitude || !updateData.longitude)) {
+        const coords = parseLatLngFromUrl(updateData.googleMapsUrl);
+        if (coords) {
+          updateData.latitude = coords.latitude;
+          updateData.longitude = coords.longitude;
+          console.log(`[updateDepot] Extracted coords from Google Maps URL: ${coords.latitude}, ${coords.longitude}`);
+        }
+      }
+      delete updateData.googleMapsUrl; // not a DB column
+
       // Convert numeric fields
       if (updateData.capacity) updateData.capacity = parseInt(updateData.capacity);
-      if (updateData.latitude) updateData.latitude = parseFloat(updateData.latitude);
-      if (updateData.longitude) updateData.longitude = parseFloat(updateData.longitude);
+      if (updateData.latitude != null) updateData.latitude = parseFloat(updateData.latitude);
+      if (updateData.longitude != null) updateData.longitude = parseFloat(updateData.longitude);
 
       // Add updated timestamp
       updateData.updated_at = new Date().toISOString();
