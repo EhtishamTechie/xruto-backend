@@ -1423,7 +1423,7 @@ function performKMeansClustering(orders, numClusters = 3, depotOverride) {
   const k = Math.min(Math.max(numClusters, minK), valid.length, 8);
 
   if (valid.length <= k) {
-    return valid.map((o, i) => buildZone(i, [o]));
+    return valid.map((o, i) => buildZone(i, [o], depotOverride));
   }
 
   const lats = valid.map(o => parseFloat(o.latitude));
