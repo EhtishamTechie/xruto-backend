@@ -238,7 +238,7 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(extractUser); // Attach user from JWT to all requests (non-blocking)
 
-// Configure multer for PDF uploads
+// Configure multer for Document uploads
 const storage = multer.memoryStorage();
 const upload = multer({
   storage: storage,
@@ -246,10 +246,18 @@ const upload = multer({
     fileSize: 10 * 1024 * 1024, // 10MB limit
   },
   fileFilter: (req, file, cb) => {
-    if (file.mimetype === 'application/pdf') {
+    const allowedTypes = [
+      'application/pdf', 
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.ms-excel',
+      'text/csv',
+      'text/plain'
+    ];
+    if (allowedTypes.includes(file.mimetype) || file.originalname.match(/\.(pdf|docx|xlsx|xls|csv|txt)$/i)) {
       cb(null, true);
     } else {
-      cb(new Error('Only PDF files are allowed'), false);
+      cb(new Error('Only PDF, Word, Excel, or Text files are allowed'), false);
     }
   }
 });
