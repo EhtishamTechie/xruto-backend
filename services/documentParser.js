@@ -36,7 +36,11 @@ class DocumentParserService {
             // Geocode addresses for each order (handles Google Maps links inside geocodeOrders)
             const ordersWithCoordinates = await this.geocodeOrders(orders);
             
-            return ordersWithCoordinates;
+            // Clean up internal properties that aren't in Supabase schema
+            return ordersWithCoordinates.map(order => {
+                const { google_maps_url, ...cleanOrder } = order;
+                return cleanOrder;
+            });
         } catch (error) {
             console.error('Error parsing document:', error);
             throw new Error('Failed to parse document: ' + error.message);
