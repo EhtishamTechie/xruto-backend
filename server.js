@@ -5,7 +5,7 @@ const multer = require('multer');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const axios = require('axios');
-const PDFParserService = require('./services/pdfParser');
+const DocumentParserService = require('./services/documentParser');
 require('dotenv').config();
 
 /** Trim / strip accidental quotes from .env so fetch target is valid. */
@@ -272,8 +272,8 @@ const excelUpload = multer({
   }
 });
 
-// Initialize PDF Parser Service
-const pdfParserService = new PDFParserService();
+// Initialize Document Parser Service
+const documentParserService = new DocumentParserService();
 
 // Request logging
 app.use((req, res, next) => {
@@ -1770,32 +1770,32 @@ function generateSimpleNavigationURL(depot, waypoints, useGoogleMaps = false) {
   return `https://wego.here.com/search/${p.lat},${p.lng}`;
 }
 
-// ===== PDF UPLOAD ENDPOINT =====
-app.post('/api/orders/upload-pdf', upload.single('pdfFile'), async (req, res) => {
+// ===== DOCUMENT UPLOAD ENDPOINT =====
+app.post('/api/orders/upload-document', upload.single('file'), async (req, res) => {
   try {
-    console.log('PDF upload request received');
+    console.log('Document upload request received');
     
     if (!req.file) {
       return res.status(400).json({
         success: false,
-        message: 'No PDF file uploaded'
+        message: 'No file uploaded'
       });
     }
 
-    console.log('Processing PDF file:', req.file.originalname);
+    console.log('Processing document file:', req.file.originalname);
     
-    // Parse PDF and extract orders
-    const orders = await pdfParserService.parsePDF(req.file.buffer);
+    // Parse Document and extract orders
+    const orders = await documentParserService.parseDocument(req.file.buffer, req.file.originalname);
     
     if (orders.length === 0) {
       return res.status(400).json({
         success: false,
-        message: 'No valid orders found in PDF. Please check the PDF format.',
+        message: 'No valid orders found in document. Please check the format.',
         orders: []
       });
     }
 
-    console.log(`Extracted ${orders.length} orders from PDF`);
+    console.log(`Extracted ${orders.length} orders from document`);
 
     // Insert orders into Supabase
     if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {

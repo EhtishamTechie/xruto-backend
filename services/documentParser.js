@@ -1,38 +1,96 @@
 const pdf = require('pdf-parse');
 const axios = require('axios');
+const mammoth = require('mammoth');
+const xlsx = require('xlsx');
 
-class PDFParserService {
+class DocumentParserService {
     constructor() {
         this.hereApiKey = process.env.HERE_API_KEY;
     }
 
     /**
-     * Parse PDF buffer and extract order data
-     * @param {Buffer} pdfBuffer - PDF file buffer
+     * Parse document buffer and extract order data
+     * @param {Buffer} buffer - File buffer
+     * @param {string} originalname - Original file name (for extension)
      * @returns {Array} Array of parsed orders
      */
-    async parsePDF(pdfBuffer) {
+    async parseDocument(buffer, originalname) {
         try {
-            const data = await pdf(pdfBuffer);
-            const text = data.text;
+            const ext = originalname.split('.').pop().toLowerCase();
+            let orders = [];
+
+            if (ext === 'pdf') {
+                const data = await pdf(buffer);
+                orders = this.extractOrdersFromText(data.text);
+            } else if (ext === 'docx') {
+                const result = await mammoth.extractRawText({ buffer: buffer });
+                orders = this.extractOrdersFromText(result.value);
+            } else if (ext === 'xlsx' || ext === 'xls' || ext === 'csv') {
+                orders = this.parseSpreadsheet(buffer);
+            } else if (ext === 'txt') {
+                orders = this.extractOrdersFromText(buffer.toString('utf-8'));
+            } else {
+                throw new Error('Unsupported file format. Please use PDF, DOCX, XLSX, CSV, or TXT.');
+            }
             
-            console.log('PDF Text Content:', text);
-            
-            // Parse the text based on common order patterns
-            const orders = this.extractOrdersFromText(text);
-            
-            // Geocode addresses for each order
+            // Geocode addresses for each order (handles Google Maps links inside geocodeOrders)
             const ordersWithCoordinates = await this.geocodeOrders(orders);
             
             return ordersWithCoordinates;
         } catch (error) {
-            console.error('Error parsing PDF:', error);
-            throw new Error('Failed to parse PDF: ' + error.message);
+            console.error('Error parsing document:', error);
+            throw new Error('Failed to parse document: ' + error.message);
         }
     }
 
     /**
-     * Extract order information from PDF text
+     * Parse spreadsheet data (XLSX/CSV)
+     * @param {Buffer} buffer - File buffer
+     * @returns {Array} Array of order objects
+     */
+    parseSpreadsheet(buffer) {
+        const workbook = xlsx.read(buffer, { type: 'buffer' });
+        const sheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[sheetName];
+        const data = xlsx.utils.sheet_to_json(sheet);
+        
+        const orders = [];
+        for (let i = 0; i < data.length; i++) {
+            const row = data[i];
+            
+            // Find columns fuzzily
+            const nameKey = Object.keys(row).find(k => k.toLowerCase().includes('name')) || Object.keys(row)[0];
+            const phoneKey = Object.keys(row).find(k => k.toLowerCase().includes('phone') || k.toLowerCase().includes('mobile'));
+            const addressKey = Object.keys(row).find(k => k.toLowerCase().includes('address') || k.toLowerCase().includes('location'));
+            const cityKey = Object.keys(row).find(k => k.toLowerCase().includes('city'));
+            const linkKey = Object.keys(row).find(k => k.toLowerCase().includes('link') || k.toLowerCase().includes('map') || k.toLowerCase().includes('url'));
+            
+            if (!row[nameKey]) continue;
+
+            const order = {
+                customer_name: String(row[nameKey]),
+                customer_email: `customer${i + 1}@email.com`,
+                customer_phone: phoneKey ? String(row[phoneKey]) : `01925${String(100000 + i).slice(1)}`,
+                delivery_address: addressKey ? String(row[addressKey]) : 'Address to be confirmed',
+                city: cityKey ? String(row[cityKey]) : 'Warrington',
+                postcode: 'WA4 1EF',
+                order_value: 50.00,
+                weight: 2.5,
+                delivery_date: new Date().toISOString().split('T')[0],
+                status: 'pending'
+            };
+            
+            if (linkKey && row[linkKey]) {
+                order.google_maps_url = String(row[linkKey]);
+            }
+
+            orders.push(order);
+        }
+        return orders;
+    }
+
+    /**
+     * Extract order information from raw text
      * @param {string} text - Raw text from PDF
      * @returns {Array} Array of order objects
      */
@@ -69,7 +127,10 @@ class PDFParserService {
             latitude: /(?:lat(?:itude)?[:\s]*)?(-?\d+\.\d+)/i,
             
             // Match longitude (decimal degrees)
-            longitude: /(?:lon(?:g|gitude)?[:\s]*)?(-?\d+\.\d+)/i
+            longitude: /(?:lon(?:g|gitude)?[:\s]*)?(-?\d+\.\d+)/i,
+
+            // Match Google Maps links
+            googleMapsLink: /(https?:\/\/(?:www\.)?google\.com\/maps[^\s]+|https?:\/\/maps\.app\.goo\.gl\/[^\s]+)/i
         };
 
         let currentOrder = {};
@@ -166,6 +227,12 @@ class PDFParserService {
                     weight = weight / 1000;
                 }
                 currentOrder.weight = weight;
+            }
+
+            // Extract Google Maps Link
+            const mapLinkMatch = line.match(patterns.googleMapsLink);
+            if (mapLinkMatch && currentOrder.customer_name) {
+                currentOrder.google_maps_url = mapLinkMatch[0];
             }
         }
         
@@ -278,7 +345,21 @@ class PDFParserService {
         
         for (const order of orders) {
             try {
-                // Skip geocoding if coordinates are already provided
+                // First, check if there's a Google Maps URL we can extract coordinates from
+                if (order.google_maps_url && (!order.latitude || !order.longitude)) {
+                    try {
+                        const coords = await this.extractCoordsFromMapUrl(order.google_maps_url);
+                        if (coords) {
+                            order.latitude = coords.lat;
+                            order.longitude = coords.lng;
+                            console.log(`Extracted coordinates from Map URL for ${order.customer_name}: ${order.latitude}, ${order.longitude}`);
+                        }
+                    } catch (e) {
+                        console.warn(`Failed to parse map URL for ${order.customer_name}:`, e.message);
+                    }
+                }
+
+                // Skip geocoding if coordinates are already provided or extracted
                 if (order.latitude && order.longitude) {
                     console.log(`Coordinates already provided for ${order.customer_name}: ${order.latitude}, ${order.longitude}`);
                     geocodedOrders.push(order);
@@ -311,6 +392,49 @@ class PDFParserService {
         }
         
         return geocodedOrders;
+    }
+
+    /**
+     * Extract coordinates from Google Maps URL (including short links)
+     * @param {string} url - Google Maps URL
+     * @returns {Object|null} Coordinates {lat, lng} or null
+     */
+    async extractCoordsFromMapUrl(url) {
+        let fullUrl = url;
+        
+        // Expand short link
+        if (url.includes('maps.app.goo.gl') || url.includes('goo.gl/maps')) {
+            try {
+                const response = await axios.get(url, {
+                    maxRedirects: 5,
+                    validateStatus: function (status) {
+                        return status >= 200 && status < 400; // Resolve redirects
+                    }
+                });
+                fullUrl = response.request.res.responseUrl || fullUrl;
+            } catch (error) {
+                console.warn('Failed to expand shortlink:', error.message);
+            }
+        }
+        
+        // Parse the full URL for coordinates
+        const tight = fullUrl.replace(/\s/g, '');
+        // !3d.!4d. - actual place pin
+        let m = tight.match(/!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)/i);
+        if (m) return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+        
+        // @lat,lng - map view center
+        m = tight.match(/@(-?\d+\.?\d*),(-?\d+\.?\d*)(?:,|\s|\/|\?|#|z|\]|$)/);
+        if (!m) m = tight.match(/@(-?\d+\.?\d*),(-?\d+\.?\d+)/);
+        if (m) return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+        
+        m = tight.match(/[?&]q=(-?\d+\.?\d*),(-?\d+\.?\d*)\b/);
+        if (m) return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+        
+        m = tight.match(/[?&]ll=(-?\d+\.?\d*),(-?\d+\.?\d*)\b/);
+        if (m) return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+
+        return null;
     }
 
     /**
@@ -436,4 +560,4 @@ class PDFParserService {
     }
 }
 
-module.exports = PDFParserService;
+module.exports = DocumentParserService;
