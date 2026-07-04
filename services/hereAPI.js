@@ -84,6 +84,11 @@ class HereAPIService {
         }
       );
 
+      if (!response.data || !response.data.matrix) {
+        console.warn('⚠️  HERE Matrix API returned unexpected structure:', JSON.stringify(response.data));
+        return this._haversineMatrix(points);
+      }
+
       const flat = response.data.matrix.travelTimes;
       const n = points.length;
       const matrix = [];
