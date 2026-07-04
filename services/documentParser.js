@@ -151,7 +151,7 @@ class DocumentParserService {
      */
     extractOrdersFromText(text) {
         // First check if this is our structured Manual Form format
-        if (text.includes('Order 1:') && text.includes('Name:') && text.includes('Address:')) {
+        if (text.includes('Order 1:') && (text.includes('Name:') || text.includes('Customer:')) && text.includes('Address:')) {
             return this.parseManualOrdersText(text);
         }
 
