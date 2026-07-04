@@ -121,11 +121,13 @@ class DocumentParserService {
             };
 
             for (const line of lines) {
-                if (line.startsWith('Name:')) order.customer_name = line.replace('Name:', '').trim() || order.customer_name;
+                if (line.startsWith('Name:') || line.startsWith('Customer:')) order.customer_name = line.replace(/Name:|Customer:/, '').trim() || order.customer_name;
                 if (line.startsWith('Phone:')) order.customer_phone = line.replace('Phone:', '').trim() || order.customer_phone;
                 if (line.startsWith('Address:')) order.delivery_address = line.replace('Address:', '').trim();
                 if (line.startsWith('City:')) order.city = line.replace('City:', '').trim();
                 if (line.startsWith('Link:')) order.google_maps_url = line.replace('Link:', '').trim();
+                if (line.startsWith('Latitude:')) order.latitude = parseFloat(line.replace('Latitude:', '').trim());
+                if (line.startsWith('Longitude:')) order.longitude = parseFloat(line.replace('Longitude:', '').trim());
                 if (line.startsWith('Coordinates:')) {
                     const coords = line.replace('Coordinates:', '').trim().split(',');
                     if (coords.length === 2) {
@@ -329,8 +331,8 @@ class DocumentParserService {
                 customer_email: `customer${i + 1}@email.com`,
                 customer_phone: `01925${String(100000 + i).slice(1)}`,
                 delivery_address: section,
-                postcode: 'WA4 1EF', // Default Warrington postcode
-                city: 'Warrington',
+                postcode: '', 
+                city: '',
                 order_value: 50.00,
                 weight: 2.5,
                 delivery_date: new Date().toISOString().split('T')[0],
@@ -425,7 +427,8 @@ class DocumentParserService {
                 }
                 
                 // Only geocode if coordinates are missing
-                const address = `${order.delivery_address}, ${order.city}, ${order.postcode}, UK`;
+                const addressParts = [order.delivery_address, order.city, order.postcode].filter(p => p && p.trim() !== '');
+                const address = addressParts.join(', ');
                 const coordinates = await this.geocodeAddress(address);
                 
                 geocodedOrders.push({
