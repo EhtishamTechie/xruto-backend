@@ -1355,8 +1355,11 @@ function buildZone(i, orders, depotOverride) {
   const centLat = orders.reduce((s, o) => s + parseFloat(o.latitude), 0) / orders.length;
   const centLng = orders.reduce((s, o) => s + parseFloat(o.longitude), 0) / orders.length;
   const distFromDepot = haversineKm(centLat, centLng, DEPOT_LAT, DEPOT_LNG);
-  const routeDistKm = orders.length * 0.8 + distFromDepot * 2;
-  const durationMins = 20 + orders.length * 8 + depotReturns * 30;
+  
+  // Winding factor 1.4x for roads, plus 1.2km between stops within cluster
+  const routeDistKm = (distFromDepot * 2 * 1.4) + (orders.length * 1.2);
+  // Speed 35 km/h, 5 mins per drop-off
+  const durationMins = (routeDistKm / 35 * 60) + (orders.length * 5) + (depotReturns * 30);
 
   // Find the most common postcode area in this cluster
   const pcCounts = {};
@@ -2373,26 +2376,9 @@ app.post('/api/orders/generate-routes', async (req, res) => {
       // Calculate REALISTIC distance and time based on Google Maps patterns
       const orderCount = zone.total_orders;
       
-      // Very realistic calculations to match Google Maps
-      let realistic_distance_km, realistic_time_minutes;
-      
-      if (orderCount <= 3) {
-        // Small routes like Google Maps shows: 0.3-0.8 km, 3-8 minutes
-        realistic_distance_km = Math.round((0.3 + (orderCount * 0.2)) * 100) / 100;
-        realistic_time_minutes = 3 + (orderCount * 2);
-      } else if (orderCount <= 6) {
-        // Medium routes: 0.8-1.5 km, 8-15 minutes
-        realistic_distance_km = Math.round((0.8 + (orderCount * 0.12)) * 100) / 100;
-        realistic_time_minutes = 8 + (orderCount * 1.5);
-      } else if (orderCount <= 9) {
-        // Larger routes: 1.5-2.5 km, 15-25 minutes
-        realistic_distance_km = Math.round((1.5 + (orderCount * 0.11)) * 100) / 100;
-        realistic_time_minutes = 15 + (orderCount * 1.2);
-      } else {
-        // Very large routes: 2.5-4 km, 25-40 minutes
-        realistic_distance_km = Math.round((2.5 + (orderCount * 0.1)) * 100) / 100;
-        realistic_time_minutes = 25 + (orderCount * 1);
-      }
+      // Use accurate distance and duration calculated by buildZone (Haversine * 1.4 + 5 mins/stop) or HERE Matrix API
+      let realistic_distance_km = zone.route_distance_km || 0;
+      let realistic_time_minutes = zone.estimated_duration || 0;
 
       return {
         route_id: routeId,
@@ -2508,21 +2494,9 @@ app.get('/api/orders/get-routes', async (req, res) => {
       if (orders && orders.length > 0) {
         const completedCount = orders.filter((order) => orderStatusMap.get(order.id) === 'delivered').length;
         const orderCount = orders.length;
-        let realistic_distance_km;
-        let realistic_time_minutes;
-        if (orderCount <= 3) {
-          realistic_distance_km = Math.round((0.3 + (orderCount * 0.2)) * 100) / 100;
-          realistic_time_minutes = 3 + (orderCount * 2);
-        } else if (orderCount <= 6) {
-          realistic_distance_km = Math.round((0.8 + (orderCount * 0.12)) * 100) / 100;
-          realistic_time_minutes = 8 + (orderCount * 1.5);
-        } else if (orderCount <= 9) {
-          realistic_distance_km = Math.round((1.5 + (orderCount * 0.11)) * 100) / 100;
-          realistic_time_minutes = 15 + (orderCount * 1.2);
-        } else {
-          realistic_distance_km = Math.round((2.5 + (orderCount * 0.1)) * 100) / 100;
-          realistic_time_minutes = 25 + (orderCount * 1);
-        }
+        // Use the route's actual distance and duration
+        let realistic_distance_km = route.total_distance_km || 0;
+        let realistic_time_minutes = route.estimated_duration_minutes || 0;
         const assignedDriverId = routeDriverMap.get(routeId) || null;
         const assignedDriver = assignedDriverId ? allDrivers.find((d) => String(d.id) === String(assignedDriverId)) : null;
         const status = (() => {
@@ -2649,16 +2623,15 @@ app.get('/api/orders/analytics-snapshot', async (req, res) => {
       const completedCount = orders.filter((o) => orderStatusMap.get(o.id) === 'delivered').length;
       totalStops += orderCount;
       delivered += completedCount;
-      let realistic_time_minutes;
-      if (orderCount <= 3) {
-        realistic_time_minutes = 3 + (orderCount * 2);
-      } else if (orderCount <= 6) {
-        realistic_time_minutes = 8 + (orderCount * 1.5);
-      } else if (orderCount <= 9) {
-        realistic_time_minutes = 15 + (orderCount * 1.2);
-      } else {
-        realistic_time_minutes = 25 + (orderCount * 1);
-      }
+      const _pd = MOCK_DEPOTS.find(d => d.is_primary) || MOCK_DEPOTS[0] || { latitude: 0, longitude: 0 };
+      const DEPOT_LAT = parseFloat(_pd.latitude) || 0, DEPOT_LNG = parseFloat(_pd.longitude) || 0;
+      
+      const centLat = orders.reduce((s, o) => s + parseFloat(o.latitude), 0) / orders.length;
+      const centLng = orders.reduce((s, o) => s + parseFloat(o.longitude), 0) / orders.length;
+      const distFromDepot = haversineKm(centLat, centLng, DEPOT_LAT, DEPOT_LNG);
+      
+      const routeDistKm = (distFromDepot * 2 * 1.4) + (orderCount * 1.2);
+      const realistic_time_minutes = (routeDistKm / 35 * 60) + (orderCount * 5);
       durationSum += Math.round(realistic_time_minutes);
       const assignedDriverId = routeDriverMap.get(routeId) || null;
       const status = (() => {
