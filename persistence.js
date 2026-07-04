@@ -45,6 +45,9 @@ function saveAll(data) {
         routeOrders: data.routeOrders instanceof Map
           ? Object.fromEntries(data.routeOrders)
           : (data.routeOrders || {}),
+        routeMetadata: data.routeMetadata instanceof Map
+          ? Object.fromEntries(data.routeMetadata)
+          : (data.routeMetadata || {}),
         orderStatuses: data.orderStatuses instanceof Map
           ? Object.fromEntries(data.orderStatuses)
           : (data.orderStatuses || {}),
