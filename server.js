@@ -1930,12 +1930,12 @@ app.post('/api/orders/upload-text', async (req, res) => {
       return {
         customer_name: order.customer_name || `Customer ${index + 1}`,
         customer_email: order.customer_email || `customer${index + 1}@email.com`,
-        customer_phone: order.customer_phone || `01925${String(100000 + index).slice(1)}`,
+        customer_phone: order.customer_phone || `000000000`,
         delivery_address: order.delivery_address || 'Address to be confirmed',
-        postcode: order.postcode || 'WA4 1EF',
-        city: order.city || 'Warrington',
-        latitude: order.latitude || 53.3900,
-        longitude: order.longitude || -2.5970,
+        postcode: order.postcode || '',
+        city: order.city || '',
+        latitude: order.latitude || null,
+        longitude: order.longitude || null,
         order_value: order.order_value || 50.00,
         weight: order.weight || 2.5,
         delivery_date: order.delivery_date || new Date().toISOString().split('T')[0],
@@ -1976,8 +1976,8 @@ app.post('/api/orders/upload-text', async (req, res) => {
       // Store in-memory when no database (so eligible/cluster endpoints can use them)
       const dateStr = new Date().toISOString().split('T')[0];
       const enriched = validOrders.map((o, idx) => {
-        const lat = parseFloat(o.latitude) || 53.3900;
-        const lng = parseFloat(o.longitude) || -2.5970;
+        const lat = o.latitude !== null ? parseFloat(o.latitude) : null;
+        const lng = o.longitude !== null ? parseFloat(o.longitude) : null;
         return {
           ...o,
           id: `mem-${Date.now()}-${idx}`,
