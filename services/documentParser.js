@@ -90,11 +90,65 @@ class DocumentParserService {
     }
 
     /**
-     * Extract order information from raw text
-     * @param {string} text - Raw text from PDF
+     * Parses the highly structured format sent by ManualOrderForm.jsx
+     */
+    parseManualOrdersText(text) {
+        const orders = [];
+        const orderBlocks = text.split(/Order \d+:/).filter(b => b.trim().length > 0);
+        
+        for (let i = 0; i < orderBlocks.length; i++) {
+            const block = orderBlocks[i].trim();
+            const lines = block.split('\n').map(l => l.trim());
+            
+            const order = {
+                customer_name: `Customer ${i + 1}`,
+                customer_email: `customer${i + 1}@email.com`,
+                customer_phone: `0000000000`,
+                delivery_address: '',
+                city: '',
+                postcode: '',
+                latitude: null,
+                longitude: null,
+                google_maps_url: '',
+                order_value: 50.00,
+                weight: 2.5,
+                delivery_date: new Date().toISOString().split('T')[0],
+                status: 'pending'
+            };
+
+            for (const line of lines) {
+                if (line.startsWith('Name:')) order.customer_name = line.replace('Name:', '').trim() || order.customer_name;
+                if (line.startsWith('Phone:')) order.customer_phone = line.replace('Phone:', '').trim() || order.customer_phone;
+                if (line.startsWith('Address:')) order.delivery_address = line.replace('Address:', '').trim();
+                if (line.startsWith('City:')) order.city = line.replace('City:', '').trim();
+                if (line.startsWith('Link:')) order.google_maps_url = line.replace('Link:', '').trim();
+                if (line.startsWith('Coordinates:')) {
+                    const coords = line.replace('Coordinates:', '').trim().split(',');
+                    if (coords.length === 2) {
+                        order.latitude = parseFloat(coords[0].trim());
+                        order.longitude = parseFloat(coords[1].trim());
+                    }
+                }
+            }
+            
+            orders.push(order);
+        }
+        
+        console.log(`Extracted ${orders.length} orders using Manual Form parser`);
+        return orders;
+    }
+
+    /**
+     * Extract orders from raw text (handles various formats)
+     * @param {string} text - Raw text
      * @returns {Array} Array of order objects
      */
     extractOrdersFromText(text) {
+        // First check if this is our structured Manual Form format
+        if (text.includes('Order 1:') && text.includes('Name:') && text.includes('Address:')) {
+            return this.parseManualOrdersText(text);
+        }
+
         const orders = [];
         
         // Split text into lines and clean up
@@ -438,30 +492,46 @@ class DocumentParserService {
     }
 
     /**
-     * Geocode a single address using HERE API
+     * Geocode a single address using HERE API with a free Nominatim fallback
      * @param {string} address - Full address string
      * @returns {Object} Coordinates {lat, lng}
      */
     async geocodeAddress(address) {
-        if (!this.hereApiKey) {
-            throw new Error('HERE API key not configured');
+        // Try HERE API first if configured
+        if (this.hereApiKey) {
+            try {
+                const encodedAddress = encodeURIComponent(address);
+                const url = `https://geocode.search.hereapi.com/v1/geocode?q=${encodedAddress}&apikey=${this.hereApiKey}`;
+                
+                const response = await axios.get(url);
+                
+                if (response.data.items && response.data.items.length > 0) {
+                    const location = response.data.items[0].position;
+                    return {
+                        lat: location.lat,
+                        lng: location.lng
+                    };
+                }
+            } catch (error) {
+                console.warn('HERE API geocoding failed, falling back to Nominatim...', error.message);
+            }
         }
         
+        // Fallback to free Nominatim API
         try {
-            const encodedAddress = encodeURIComponent(address);
-            const url = `https://geocode.search.hereapi.com/v1/geocode?q=${encodedAddress}&apikey=${this.hereApiKey}`;
+            console.log(`Using free Nominatim API to geocode: ${address}`);
+            const encoded = encodeURIComponent(address);
+            const response = await axios.get(`https://nominatim.openstreetmap.org/search?format=json&q=${encoded}&limit=1`, {
+                headers: { 'User-Agent': 'xRuto/1.0' } // Nominatim requires a User-Agent
+            });
             
-            const response = await axios.get(url);
-            
-            if (response.data.items && response.data.items.length > 0) {
-                const location = response.data.items[0].position;
+            if (response.data && response.data.length > 0) {
                 return {
-                    lat: location.lat,
-                    lng: location.lng
+                    lat: parseFloat(response.data[0].lat),
+                    lng: parseFloat(response.data[0].lon)
                 };
-            } else {
-                throw new Error('No geocoding results found');
             }
+            throw new Error('No geocoding results found from Nominatim either');
         } catch (error) {
             console.error('Geocoding error:', error.message);
             throw error;
