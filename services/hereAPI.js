@@ -78,7 +78,7 @@ class HereAPIService {
           matrixAttributes: ['travelTimes']
         },
         {
-          params: { apikey: this.apiKey },
+          params: { apikey: this.apiKey, async: false },
           headers: { 'Content-Type': 'application/json' },
           timeout: 30000
         }
