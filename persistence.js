@@ -50,9 +50,15 @@ function saveAll(data) {
           : (data.orderStatuses || {}),
         routeDrivers: data.routeDrivers instanceof Map
           ? Object.fromEntries(data.routeDrivers)
-          : (data.routeDrivers || {})
+          : (data.routeDrivers || {}),
+        passwordResetTokens: data.passwordResetTokens instanceof Map
+          ? Object.fromEntries(data.passwordResetTokens)
+          : (data.passwordResetTokens || {})
       };
-      fs.writeFileSync(DB_PATH, JSON.stringify(serializable, null, 2), 'utf-8');
+      // Atomic write to prevent file corruption if server crashes during write
+      const tmpPath = DB_PATH + '.tmp';
+      fs.writeFileSync(tmpPath, JSON.stringify(serializable, null, 2), 'utf-8');
+      fs.renameSync(tmpPath, DB_PATH);
     } catch (err) {
       console.error('[persistence] Failed to write db.json:', err.message);
     }

@@ -60,7 +60,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'xruto-dev-secret';
 
 // ===== PASSWORD RESET TOKEN STORE =====
 // Map of token → { email, expiresAt }  (tokens expire after 15 minutes)
-const passwordResetTokens = new Map();
+let passwordResetTokens = new Map();
 
 /**
  * Send a password-reset email via the configured email provider.
@@ -179,6 +179,10 @@ let routeDriverMap = _persisted.routeDrivers
   : new Map();
 let inMemoryOrders = _persisted.orders || [];
 
+passwordResetTokens = _persisted.passwordResetTokens
+  ? new Map(Object.entries(_persisted.passwordResetTokens))
+  : new Map();
+
 // Helper: flush all stores to disk
 function persist() {
   saveAll({
@@ -189,7 +193,8 @@ function persist() {
     routeOrders: routeOrdersMap,
     orderStatuses: orderStatusMap,
     routeDrivers: routeDriverMap,
-    users: USERS
+    users: USERS,
+    passwordResetTokens
   });
 }
 /**
@@ -3357,18 +3362,28 @@ app.post('/api/orders/sync-woocommerce', requireAuth, requireRole('admin'), asyn
 
     for (const store of stores) {
       try {
-        // Call WooCommerce REST API v3 — requires consumer_key & consumer_secret
-        const wooRes = await axios.get(`${store.url}/wp-json/wc/v3/orders`, {
-          params: {
-            status: 'processing',
-            per_page: 100,
-            consumer_key: store.consumer_key,
-            consumer_secret: store.consumer_secret
-          },
-          timeout: 30000
-        });
+        let page = 1;
+        let totalPages = 1;
+        let allWooOrders = [];
 
-        const wooOrders = wooRes.data || [];
+        do {
+          const wooRes = await axios.get(`${store.url}/wp-json/wc/v3/orders`, {
+            params: {
+              status: 'processing',
+              per_page: 100,
+              page: page,
+              consumer_key: store.consumer_key,
+              consumer_secret: store.consumer_secret
+            },
+            timeout: 30000
+          });
+
+          allWooOrders = allWooOrders.concat(wooRes.data || []);
+          totalPages = parseInt(wooRes.headers['x-wp-totalpages'] || '1', 10);
+          page++;
+        } while (page <= totalPages);
+
+        const wooOrders = allWooOrders;
 
         // Filter only home-delivery orders (skip pickup / click-and-collect)
         const homeDeliveryOrders = wooOrders.filter(wo => {
@@ -3538,6 +3553,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     if (data.email === user.email) passwordResetTokens.delete(t);
   }
   passwordResetTokens.set(token, { email: user.email, expiresAt });
+  persist();
 
   const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
   const resetLink = `${clientUrl}?reset_token=${token}`;
