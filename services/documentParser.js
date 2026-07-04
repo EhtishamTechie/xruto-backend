@@ -385,8 +385,8 @@ class DocumentParserService {
                 // Use default Warrington coordinates if geocoding fails
                 geocodedOrders.push({
                     ...order,
-                    latitude: order.latitude || 53.3900,
-                    longitude: order.longitude || -2.5970
+                    latitude: order.latitude || null,
+                    longitude: order.longitude || null
                 });
             }
         }

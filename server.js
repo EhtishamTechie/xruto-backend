@@ -177,6 +177,9 @@ let orderStatusMap = _persisted.orderStatuses
 let routeDriverMap = _persisted.routeDrivers
   ? new Map(Object.entries(_persisted.routeDrivers))
   : new Map();
+let routeMetadataMap = _persisted.routeMetadata
+  ? new Map(Object.entries(_persisted.routeMetadata))
+  : new Map();
 let inMemoryOrders = _persisted.orders || [];
 
 passwordResetTokens = _persisted.passwordResetTokens
@@ -191,6 +194,7 @@ function persist() {
     drivers: MOCK_DRIVERS,
     orders: inMemoryOrders,
     routeOrders: routeOrdersMap,
+    routeMetadata: routeMetadataMap,
     orderStatuses: orderStatusMap,
     routeDrivers: routeDriverMap,
     users: USERS,
@@ -1112,8 +1116,6 @@ app.get('/api/admin/health', async (req, res) => {
 app.get('/api/admin/test', async (req, res) => {
   return res.json({ success: true, message: 'Admin API reachable' });
 });
-// Add this endpoint to your server.js file after the existing order endpoints (around line 350)
-
 
 // Add driver status update endpoint
 app.post('/api/orders/driver-update-status', async (req, res) => {
@@ -1473,7 +1475,6 @@ function performKMeansClustering(orders, numClusters = 3, depotOverride) {
   // Build zones, skip empty clusters
   return clusters.filter(cl => cl.length > 0).map((cl, i) => buildZone(i, cl, depotOverride));
 }
-// Add these helper functions after performKMeansClustering function (around line 200)
 
 /** 0,0 (Null Island) and invalid floats break Google Maps; browser geolocation is never used in these URLs. */
 function isNullIsland(lat, lng) {
@@ -2306,6 +2307,12 @@ app.post('/api/orders/generate-routes', async (req, res) => {
       // Store the actual orders for this route
       routeOrdersMap.set(routeId, zone.orders || []);
       
+      // Store metadata
+      routeMetadataMap.set(routeId, {
+        total_distance_km: zone.route_distance_km || 0,
+        estimated_duration_minutes: zone.estimated_duration || 0
+      });
+      
       // Initialize order statuses as pending
       if (zone.orders) {
         zone.orders.forEach(order => {
@@ -2494,9 +2501,10 @@ app.get('/api/orders/get-routes', async (req, res) => {
       if (orders && orders.length > 0) {
         const completedCount = orders.filter((order) => orderStatusMap.get(order.id) === 'delivered').length;
         const orderCount = orders.length;
+        const meta = routeMetadataMap.get(routeId) || {};
         // Use the route's actual distance and duration
-        let realistic_distance_km = route.total_distance_km || 0;
-        let realistic_time_minutes = route.estimated_duration_minutes || 0;
+        let realistic_distance_km = meta.total_distance_km || 0;
+        let realistic_time_minutes = meta.estimated_duration_minutes || 0;
         const assignedDriverId = routeDriverMap.get(routeId) || null;
         const assignedDriver = assignedDriverId ? allDrivers.find((d) => String(d.id) === String(assignedDriverId)) : null;
         const status = (() => {
