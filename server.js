@@ -1124,6 +1124,11 @@ app.post('/api/orders/driver-update-status', async (req, res) => {
     
     console.log(`Driver ${driver_id} updating order ${order_id} to ${status}`);
 
+    // ALWAYS update memory storage for driver updates because generated routes 
+    // fall back to memory which needs the updated order statuses!
+    orderStatusMap.set(order_id, status);
+    persist();
+
     if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
       const { createClient } = require('@supabase/supabase-js');
       const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
@@ -3890,6 +3895,11 @@ app.post('/api/orders/driver-update-status', async (req, res) => {
     const { driver_id, order_id, status, location, notes } = req.body;
     
     console.log(`🔄 Driver ${driver_id} updating order ${order_id} to ${status}`);
+
+    // ALWAYS update memory storage for driver updates because generated routes 
+    // fall back to memory which needs the updated order statuses!
+    orderStatusMap.set(order_id, status);
+    persist();
 
     if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
       try {
