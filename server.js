@@ -3220,7 +3220,7 @@ app.put('/api/orders/delivery-status/:orderId', async (req, res) => {
       const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
       
       const updateData = {
-        status: status,
+        delivery_status: status,
         updated_at: new Date().toISOString()
       };
 
