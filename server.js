@@ -2480,9 +2480,41 @@ app.post('/api/orders/generate-routes', async (req, res) => {
   }
 });
 
+// Sync order statuses from Supabase to in-memory map
+async function syncOrderStatusesFromSupabase() {
+  if (process.env.SUPABASE_URL && process.env.SUPABASE_ANON_KEY) {
+    try {
+      const { createClient } = require('@supabase/supabase-js');
+      const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+      const orderIds = Array.from(orderStatusMap.keys());
+      if (orderIds.length > 0) {
+        const chunkSize = 200;
+        for (let i = 0; i < orderIds.length; i += chunkSize) {
+          const chunk = orderIds.slice(i, i + chunkSize);
+          const { data: dbOrders, error } = await supabase.from('orders').select('id, delivery_status, status').in('id', chunk);
+          if (dbOrders && !error) {
+            let updated = false;
+            dbOrders.forEach(o => {
+              const st = o.delivery_status || o.status;
+              if (st && orderStatusMap.get(o.id) !== st) {
+                orderStatusMap.set(o.id, st);
+                updated = true;
+              }
+            });
+            if (updated) persist();
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Status sync error:', e.message);
+    }
+  }
+}
+
 // Get generated routes endpoint
 app.get('/api/orders/get-routes', async (req, res) => {
   try {
+    await syncOrderStatusesFromSupabase();
     const { date = new Date().toISOString().split('T')[0] } = req.query;
     const slim = String(req.query.slim) === '1' || String(req.query.slim) === 'true';
 
@@ -2614,6 +2646,7 @@ app.get('/api/orders/get-routes', async (req, res) => {
  */
 app.get('/api/orders/analytics-snapshot', async (req, res) => {
   try {
+    await syncOrderStatusesFromSupabase();
     const end = (req.query.end && String(req.query.end).slice(0, 10)) || new Date().toISOString().split('T')[0];
     const start = (req.query.start && String(req.query.start).slice(0, 10)) || end;
     const activeStatuses = new Set(['dispatched', 'in_progress', 'in_route', 'assigned']);
